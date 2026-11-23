@@ -20,6 +20,7 @@
 #include <QComboBox>
 #include <QPushButton>
 #include <QLabel>
+#include <QHBoxLayout>
 #include <cmath>
 
 namespace {
@@ -76,18 +77,30 @@ MainWindow::MainWindow(QWidget *parent)
     ui->videoDetails->setMaximumWidth(230);
     ui->progressBar->setTextVisible(true);
 
-    // Add Encoder selector + Discord Auto-fit button to sidebar
+    // Add Encoder selector + Discord Auto-fit buttons to sidebar
     auto *encoderLabel = new QLabel("Encoder", ui->videoDetails);
     m_encoderCombo = new QComboBox(ui->videoDetails);
     m_encoderCombo->setEnabled(false);
 
-    m_fitDiscordButton = new QPushButton("Auto-fit <10 MB", ui->videoDetails);
-    m_fitDiscordButton->setToolTip("Automatically adjust bitrate to fit under Discord's 10 MB limit");
-    m_fitDiscordButton->setEnabled(false);
+    auto *fitLabel = new QLabel("Auto-fit Discord", ui->videoDetails);
+    auto *fitRow = new QHBoxLayout();
+    fitRow->setSpacing(6);
+
+    m_fit10MbButton = new QPushButton("<10 MB", ui->videoDetails);
+    m_fit10MbButton->setToolTip("Automatically adjust bitrate to fit under 10 MB (~9.3 MB)");
+    m_fit10MbButton->setEnabled(false);
+
+    m_fit20MbButton = new QPushButton("<20 MB", ui->videoDetails);
+    m_fit20MbButton->setToolTip("Automatically adjust bitrate to fit under 20 MB (~18.8 MB)");
+    m_fit20MbButton->setEnabled(false);
+
+    fitRow->addWidget(m_fit10MbButton);
+    fitRow->addWidget(m_fit20MbButton);
 
     ui->verticalLayout_3->addWidget(encoderLabel);
     ui->verticalLayout_3->addWidget(m_encoderCombo);
-    ui->verticalLayout_3->addWidget(m_fitDiscordButton);
+    ui->verticalLayout_3->addWidget(fitLabel);
+    ui->verticalLayout_3->addLayout(fitRow);
 
     // Ensure videoContainer has a layout
     if (!ui->videoContainer->layout()) {
@@ -111,7 +124,8 @@ MainWindow::MainWindow(QWidget *parent)
     connect(ui->outputButton, &QPushButton::clicked, this, &MainWindow::selectOutputFile);
     connect(ui->startButton, &QPushButton::clicked, this, &MainWindow::startEncoding);
     connect(ui->aboutButton, &QPushButton::clicked, this, &MainWindow::showAboutDialog);
-    connect(m_fitDiscordButton, &QPushButton::clicked, this, &MainWindow::fitToDiscordLimit);
+    connect(m_fit10MbButton, &QPushButton::clicked, this, [this]() { fitToDiscordLimit(9.3); });
+    connect(m_fit20MbButton, &QPushButton::clicked, this, [this]() { fitToDiscordLimit(18.8); });
 
     ffmpegProcess->setProcessChannelMode(QProcess::SeparateChannels);
     connect(ffmpegProcess, &QProcess::readyReadStandardOutput,
@@ -591,13 +605,10 @@ void MainWindow::updateEstimatedFileSize()
         );
 }
 
-void MainWindow::fitToDiscordLimit()
+void MainWindow::fitToDiscordLimit(double targetSizeMB)
 {
     if (!m_player || m_sourceInfo.duration <= 0)
         return;
-
-    // Target 9.3 MB to leave safe headroom for MP4 muxing overhead & VBR spikes (<10 MB Discord limit)
-    constexpr double TARGET_MB = 9.3;
 
     double durationSec = m_sourceInfo.duration;
     const qint64 startMs = m_player->trimStart();
@@ -608,7 +619,7 @@ void MainWindow::fitToDiscordLimit()
     if (durationSec <= 0.1)
         return;
 
-    const double totalTargetKbps = (TARGET_MB * 8.0 * 1024.0) / durationSec;
+    const double totalTargetKbps = (targetSizeMB * 8.0 * 1024.0) / durationSec;
 
     int audioBitrate = 0;
     if (m_sourceInfo.hasAudio) {
@@ -828,7 +839,8 @@ void MainWindow::selectInputFile()
     ui->resolutionCombo->setEnabled(true);
     ui->resolutionCombo->blockSignals(false);
 
-    m_fitDiscordButton->setEnabled(true);
+    m_fit10MbButton->setEnabled(true);
+    m_fit20MbButton->setEnabled(true);
     ui->progressBar->setValue(0);
 
     // ---- Output path ----
@@ -889,7 +901,8 @@ void MainWindow::setEncodingUiBusy(bool busy)
     ui->videoBitrateSlider->setEnabled(!busy);
     ui->audioBitrateSlider->setEnabled(!busy && m_sourceInfo.hasAudio);
     m_encoderCombo->setEnabled(!busy);
-    m_fitDiscordButton->setEnabled(!busy);
+    m_fit10MbButton->setEnabled(!busy);
+    m_fit20MbButton->setEnabled(!busy);
 }
 
 void MainWindow::startEncoding()
@@ -1158,7 +1171,7 @@ void MainWindow::showAboutDialog()
 {
     QMessageBox::about(this, "About",
                        "<p><b>Clip2Disc (AV1 Support Fork)</b></p>"
-                       "<p>A wrapper for FFmpeg video compressor that reduces video size to under 10MB, allowing them to be sent in Discord chats.</p>"
-                       "<p>Includes AV1 playback & preview fallback, 10-bit to 8-bit Discord-safe encoding, NVIDIA NVENC support, and Discord 10MB auto-fit.</p>"
+                       "<p>A wrapper for FFmpeg video compressor that reduces video size to fit Discord upload limits (10MB / 20MB).</p>"
+                       "<p>Includes AV1 playback & preview fallback, 10-bit to 8-bit Discord-safe encoding, NVIDIA NVENC support, and Discord 10MB/20MB auto-fit.</p>"
                        "<p><a href='https://github.com/murdoockds/clip2disc'>Original GitHub Repository</a></p>");
 }

@@ -34,7 +34,7 @@ private slots:
     void onEncodingProcessError(QProcess::ProcessError error);
     void onPlaybackFailed(const QString &reason);
     void onProxyFinished(int exitCode, QProcess::ExitStatus exitStatus);
-    void fitToDiscordLimit();
+    void fitToDiscordLimit(double targetSizeMB);
     void showAboutDialog();
     void updateEstimatedFileSize();
     void updateMarkedDuration(qint64 startMs, qint64 endMs);
@@ -62,7 +62,8 @@ private:
     Ui::MainWindow *ui = nullptr;
     Player *m_player = nullptr;
     QComboBox *m_encoderCombo = nullptr;
-    QPushButton *m_fitDiscordButton = nullptr;
+    QPushButton *m_fit10MbButton = nullptr;
+    QPushButton *m_fit20MbButton = nullptr;
 
     VideoInfo m_sourceInfo;
 
