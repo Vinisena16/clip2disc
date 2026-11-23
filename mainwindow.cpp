@@ -122,6 +122,11 @@ MainWindow::MainWindow(QWidget *parent)
     fitRow->addWidget(m_fit10MbButton);
     fitRow->addWidget(m_fit20MbButton);
 
+    m_estimateHintLabel = new QLabel("Select a video to estimate size", ui->videoDetails);
+    m_estimateHintLabel->setWordWrap(true);
+    m_estimateHintLabel->setStyleSheet("color: #949BA4; font-size: 11px;");
+
+    ui->verticalLayout_3->addWidget(m_estimateHintLabel);
     ui->verticalLayout_3->addWidget(encoderLabel);
     ui->verticalLayout_3->addWidget(m_encoderCombo);
     ui->verticalLayout_3->addSpacing(4);
@@ -242,6 +247,11 @@ MainWindow::MainWindow(QWidget *parent)
                 if (!m_userAdjustedVideoBitrate)
                     autoAdjustVideoBitrateForResolution();
 
+                updateEstimatedFileSize();
+            });
+
+    connect(m_encoderCombo, &QComboBox::currentIndexChanged,
+            this, [this](int) {
                 updateEstimatedFileSize();
             });
 
@@ -825,7 +835,9 @@ void MainWindow::onProxyFinished(int exitCode, QProcess::ExitStatus exitStatus)
 void MainWindow::updateEstimatedFileSize()
 {
     if (!m_player || m_sourceInfo.duration <= 0) {
-        ui->fileSizeLabel->setText("—");
+        ui->fileSizeLabel->setText("Est. size: —");
+        if (m_estimateHintLabel)
+            m_estimateHintLabel->setText("Select a video to estimate size");
         return;
     }
 
@@ -850,6 +862,20 @@ void MainWindow::updateEstimatedFileSize()
     int videoBitrate =
         computeScaledVideoBitrate(userVideoBitrate, outW, outH, fps);
 
+    // Show real effective video bitrate when resolution/FPS scaling lowers it
+    if (videoBitrate != userVideoBitrate) {
+        ui->videoBitrateLabel->setText(
+            QString("Bitrate: %1 kbps (eff. %2)")
+                .arg(userVideoBitrate)
+                .arg(videoBitrate));
+    } else if (m_sourceInfo.videoBitrate > 0) {
+        int percent = int((qint64(userVideoBitrate) * 100) / m_sourceInfo.videoBitrate);
+        ui->videoBitrateLabel->setText(
+            QString("Bitrate: %1 kbps (%2%)")
+                .arg(userVideoBitrate)
+                .arg(percent));
+    }
+
     // --- Audio bitrate ---
     int audioBitrate = 0;
     if (m_sourceInfo.hasAudio) {
@@ -860,7 +886,7 @@ void MainWindow::updateEstimatedFileSize()
 
     double totalBitrateKbps = videoBitrate + audioBitrate;
     if (totalBitrateKbps <= 0) {
-        ui->fileSizeLabel->setText("—");
+        ui->fileSizeLabel->setText("Est. size: —");
         return;
     }
 
@@ -875,20 +901,41 @@ void MainWindow::updateEstimatedFileSize()
     double sizeMB =
         (totalBitrateKbps * durationSec) / (8.0 * 1024.0);
 
-    ui->fileSizeLabel->setText(
-        QString("Est. size: ~%1 MB")
-            .arg(sizeMB, 0, 'f', 1)
-        );
+    QString badge;
+    QString colorHex;
+    QString hint;
 
     if (sizeMB <= 10.0) {
-        ui->fileSizeLabel->setStyleSheet(
-            "color: #23A55A; font-weight: 700; padding: 4px 8px; border-radius: 6px; background-color: #1E1F22;");
+        badge = "✓ <10 MB";
+        colorHex = "#23A55A";
+        hint = QString("Fits Discord Mobile & PC (%1 kbps total • %2s)")
+                   .arg(int(totalBitrateKbps))
+                   .arg(durationSec, 0, 'f', 1);
     } else if (sizeMB <= 20.0) {
-        ui->fileSizeLabel->setStyleSheet(
-            "color: #7983F5; font-weight: 700; padding: 4px 8px; border-radius: 6px; background-color: #1E1F22;");
+        badge = "✓ <20 MB";
+        colorHex = "#7983F5";
+        hint = QString("Fits Discord PC (%1 kbps total • %2s)")
+                   .arg(int(totalBitrateKbps))
+                   .arg(durationSec, 0, 'f', 1);
     } else {
-        ui->fileSizeLabel->setStyleSheet(
-            "color: #F23F43; font-weight: 700; padding: 4px 8px; border-radius: 6px; background-color: #1E1F22;");
+        badge = "⚠ >20 MB";
+        colorHex = "#F23F43";
+        hint = QString("Too large (%1 kbps • %2s) — lower bitrate/res, trim, or click Auto-fit")
+                   .arg(int(totalBitrateKbps))
+                   .arg(durationSec, 0, 'f', 1);
+    }
+
+    ui->fileSizeLabel->setText(
+        QString("Est. size: ~%1 MB  (%2)")
+            .arg(sizeMB, 0, 'f', 1)
+            .arg(badge));
+
+    ui->fileSizeLabel->setStyleSheet(
+        QString("color: %1; font-weight: 700; padding: 5px 8px; border-radius: 6px; background-color: #1E1F22;")
+            .arg(colorHex));
+
+    if (m_estimateHintLabel) {
+        m_estimateHintLabel->setText(hint);
     }
 }
 

@@ -9,6 +9,7 @@
 class Player;
 class QComboBox;
 class QPushButton;
+class QLabel;
 
 QT_BEGIN_NAMESPACE
 namespace Ui {
@@ -71,6 +72,7 @@ private:
     QComboBox *m_encoderCombo = nullptr;
     QPushButton *m_fit10MbButton = nullptr;
     QPushButton *m_fit20MbButton = nullptr;
+    QLabel *m_estimateHintLabel = nullptr;
 
     VideoInfo m_sourceInfo;
 
