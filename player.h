@@ -9,6 +9,7 @@ class QMediaPlayer;
 class QAudioOutput;
 class QVideoWidget;
 class QPushButton;
+class QLabel;
 class ClickOverlay;
 class TimelineWidget;
 
@@ -28,10 +29,22 @@ public:
     void setFrameRate(double fps);
     void setOverlayStatus(const QString &text, bool clickable = false);
 
-    void pause();
+    bool hasMedia() const { return m_hasMedia; }
 
     qint64 trimStart() const;
     qint64 trimEnd() const;
+
+public slots:
+    void pause();
+    void togglePlayPause();
+    void goToStart();
+    void stepFrameForward();
+    void stepFrameBackward();
+    void markStartAtCurrentFrame();
+    void markEndAtCurrentFrame();
+    void selectLast30Seconds();
+    void select30SecondsFromHere();
+    void selectFullVideo();
 
 signals:
     void trimChanged(qint64 startMs, qint64 endMs);
@@ -47,17 +60,15 @@ protected:
 
 private:
     void updateControlsEnabled(bool enabled);
+    void updateTimeLabels();
     void checkVideoTrackLoaded(int generation);
+    static QString formatTimestamp(qint64 ms);
+
     bool m_hasMedia = false;
 
     // --- Playback helpers ---
     void play();
     void stop();
-    void goToStart();
-    void stepFrameForward();
-    void stepFrameBackward();
-    void markStartAtCurrentFrame();
-    void markEndAtCurrentFrame();
 
     // --- State ---
     bool m_autoPlayPending   = false;
@@ -78,6 +89,10 @@ private:
     TimelineWidget *m_timeline        = nullptr;
     ClickOverlay   *m_overlay         = nullptr;
 
+    QLabel         *m_inTimeLabel     = nullptr;
+    QLabel         *m_currentTimeLabel = nullptr;
+    QLabel         *m_outTimeLabel    = nullptr;
+
     QPushButton    *m_btnGoToStart    = nullptr;
     QPushButton    *m_btnPrevFrame    = nullptr;
     QPushButton    *m_btnSetStart     = nullptr;
@@ -85,6 +100,10 @@ private:
     QPushButton    *m_btnSetEnd       = nullptr;
     QPushButton    *m_btnNextFrame    = nullptr;
     QPushButton    *m_btnStop         = nullptr;
+
+    QPushButton    *m_btnLast30s      = nullptr;
+    QPushButton    *m_btn30sHere      = nullptr;
+    QPushButton    *m_btnFullClip     = nullptr;
 
     QSlider *m_volumeSlider = nullptr;
 };

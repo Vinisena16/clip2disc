@@ -18,6 +18,21 @@
 #include <QtMath>
 
 static constexpr qint64 DEFAULT_FRAME_STEP_MS = 40; // ~25fps fallback
+static constexpr qint64 CLIP_WINDOW_30S_MS    = 30000;
+
+QString Player::formatTimestamp(qint64 ms)
+{
+    if (ms < 0)
+        ms = 0;
+    const qint64 totalSec = ms / 1000;
+    const qint64 mins = totalSec / 60;
+    const qint64 secs = totalSec % 60;
+    const qint64 tenths = (ms % 1000) / 100;
+    return QString("%1:%2.%3")
+        .arg(mins, 2, 10, QChar('0'))
+        .arg(secs, 2, 10, QChar('0'))
+        .arg(tenths);
+}
 
 Player::Player(QWidget *parent)
     : QWidget(parent)
@@ -30,7 +45,7 @@ Player::Player(QWidget *parent)
 
     // --- Video widget ---
     m_videoWidget = new QVideoWidget(this);
-    m_videoWidget->setStyleSheet("background-color: black;");
+    m_videoWidget->setStyleSheet("background-color: #111214; border-radius: 6px;");
     m_player->setVideoOutput(m_videoWidget);
 
     if (auto *sink = m_videoWidget->videoSink()) {
@@ -55,19 +70,40 @@ Player::Player(QWidget *parent)
     m_overlay->show();
     m_overlay->raise();
 
+    // --- Time info strip ---
+    m_inTimeLabel = new QLabel("In: 00:00.0", this);
+    m_inTimeLabel->setObjectName("timeBadge");
+
+    m_currentTimeLabel = new QLabel("00:00.0 / 00:00.0  •  Clip: 0.0s", this);
+    m_currentTimeLabel->setObjectName("timeCurrent");
+    m_currentTimeLabel->setAlignment(Qt::AlignCenter);
+
+    m_outTimeLabel = new QLabel("Out: 00:00.0", this);
+    m_outTimeLabel->setObjectName("timeBadge");
+    m_outTimeLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+
+    auto *timeLayout = new QHBoxLayout;
+    timeLayout->setContentsMargins(6, 2, 6, 0);
+    timeLayout->addWidget(m_inTimeLabel);
+    timeLayout->addStretch();
+    timeLayout->addWidget(m_currentTimeLabel);
+    timeLayout->addStretch();
+    timeLayout->addWidget(m_outTimeLabel);
+
     // --- Timeline ---
     m_timeline = new TimelineWidget(this);
     m_timeline->setEnabled(false);
+    m_timeline->setToolTip("Drag start/end handles to trim, or drag the highlighted bar to slide your clip window");
 
     connect(m_player, &QMediaPlayer::durationChanged,
             this, [this](qint64 durationMs) {
                 if (durationMs <= 0)
                     return;
-                // Keep ffprobe-provided duration & user trim marks when swapping in a proxy
                 if (m_usingProxy && m_timeline->duration() > 0)
                     return;
                 if (m_timeline->duration() <= 0) {
                     m_timeline->setDuration(durationMs);
+                    updateTimeLabels();
                     emit trimChanged(m_timeline->startPosition(), m_timeline->endPosition());
                 }
             });
@@ -113,9 +149,6 @@ Player::Player(QWidget *parent)
                     play();
 
                     if (m_expectVideo && !m_usingProxy) {
-                        // Verify that a real decoded video frame actually arrives (catches
-                        // silent black-screen failures when Qt's bundled FFmpeg cannot
-                        // hardware-decode AV1 and has no software libdav1d fallback).
                         const int gen = m_loadGeneration;
                         QTimer::singleShot(1200, this, [this, gen]() {
                             checkVideoTrackLoaded(gen);
@@ -135,38 +168,71 @@ Player::Player(QWidget *parent)
                     m_player->setPosition(end);
                     m_reachedTrimEnd = true;
                     m_btnPlayPause->setIcon(style()->standardIcon(QStyle::SP_MediaPlay));
+                    m_timeline->setPlayPosition(end);
+                    updateTimeLabels();
                     return;
                 }
                 m_timeline->setPlayPosition(pos);
+                updateTimeLabels();
             });
 
     connect(m_timeline, &TimelineWidget::playPositionChanged,
             this, [this](qint64 pos) {
                 m_reachedTrimEnd = false;
                 m_player->setPosition(pos);
+                updateTimeLabels();
             });
 
-    // --- Buttons ---
+    // --- Playback buttons ---
     m_btnGoToStart = new QPushButton(this);
     m_btnGoToStart->setIcon(style()->standardIcon(QStyle::SP_MediaSkipBackward));
+    m_btnGoToStart->setToolTip("Jump to clip start (Home)");
+    m_btnGoToStart->setFixedSize(32, 30);
+
+    m_btnSetStart = new QPushButton("[ In", this);
+    m_btnSetStart->setToolTip("Set trim start at current frame (I)");
+    m_btnSetStart->setFixedHeight(30);
 
     m_btnPrevFrame = new QPushButton(this);
     m_btnPrevFrame->setIcon(style()->standardIcon(QStyle::SP_MediaSeekBackward));
-
-    m_btnSetStart = new QPushButton(this);
-    m_btnSetStart->setIcon(style()->standardIcon(QStyle::SP_ArrowForward));
+    m_btnPrevFrame->setToolTip("Previous frame (Left Arrow)");
+    m_btnPrevFrame->setFixedSize(32, 30);
 
     m_btnPlayPause = new QPushButton(this);
+    m_btnPlayPause->setObjectName("playPauseButton");
     m_btnPlayPause->setIcon(style()->standardIcon(QStyle::SP_MediaPlay));
-
-    m_btnSetEnd = new QPushButton(this);
-    m_btnSetEnd->setIcon(style()->standardIcon(QStyle::SP_ArrowBack));
+    m_btnPlayPause->setToolTip("Play / Pause (Space)");
+    m_btnPlayPause->setFixedSize(42, 30);
 
     m_btnNextFrame = new QPushButton(this);
     m_btnNextFrame->setIcon(style()->standardIcon(QStyle::SP_MediaSeekForward));
+    m_btnNextFrame->setToolTip("Next frame (Right Arrow)");
+    m_btnNextFrame->setFixedSize(32, 30);
+
+    m_btnSetEnd = new QPushButton("Out ]", this);
+    m_btnSetEnd->setToolTip("Set trim end at current frame (O)");
+    m_btnSetEnd->setFixedHeight(30);
 
     m_btnStop = new QPushButton(this);
     m_btnStop->setIcon(style()->standardIcon(QStyle::SP_MediaStop));
+    m_btnStop->setToolTip("Stop");
+    m_btnStop->setFixedSize(32, 30);
+
+    // --- Quick clip-window presets ---
+    m_btnLast30s = new QPushButton("Last 30s", this);
+    m_btnLast30s->setObjectName("presetButton");
+    m_btnLast30s->setToolTip("Select the last 30 seconds (then drag the bar on the timeline to adjust)");
+    m_btnLast30s->setFixedHeight(30);
+
+    m_btn30sHere = new QPushButton("30s Here", this);
+    m_btn30sHere->setObjectName("presetButton");
+    m_btn30sHere->setToolTip("Select a 30-second window starting at the current playhead");
+    m_btn30sHere->setFixedHeight(30);
+
+    m_btnFullClip = new QPushButton("Full", this);
+    m_btnFullClip->setObjectName("presetButton");
+    m_btnFullClip->setToolTip("Reset selection to the entire video");
+    m_btnFullClip->setFixedHeight(30);
 
     connect(m_btnGoToStart, &QPushButton::clicked, this, &Player::goToStart);
     connect(m_btnPrevFrame, &QPushButton::clicked, this, &Player::stepFrameBackward);
@@ -174,23 +240,18 @@ Player::Player(QWidget *parent)
     connect(m_btnSetStart, &QPushButton::clicked, this, &Player::markStartAtCurrentFrame);
     connect(m_btnSetEnd, &QPushButton::clicked, this, &Player::markEndAtCurrentFrame);
     connect(m_btnStop, &QPushButton::clicked, this, &Player::stop);
+    connect(m_btnPlayPause, &QPushButton::clicked, this, &Player::togglePlayPause);
 
-    connect(m_btnPlayPause, &QPushButton::clicked, this, [this] {
-        if (m_player->playbackState() == QMediaPlayer::PlayingState) {
-            pause();
-        } else {
-            if (m_reachedTrimEnd) {
-                m_player->setPosition(m_timeline->startPosition());
-                m_reachedTrimEnd = false;
-            }
-            play();
-        }
-    });
+    connect(m_btnLast30s, &QPushButton::clicked, this, &Player::selectLast30Seconds);
+    connect(m_btn30sHere, &QPushButton::clicked, this, &Player::select30SecondsFromHere);
+    connect(m_btnFullClip, &QPushButton::clicked, this, &Player::selectFullVideo);
 
     // --- Volume slider ---
     m_volumeSlider = new QSlider(Qt::Horizontal, this);
     m_volumeSlider->setRange(0, 100);
     m_volumeSlider->setValue(50);
+    m_volumeSlider->setFixedWidth(85);
+    m_volumeSlider->setToolTip("Preview Volume");
     m_audioOutput->setVolume(0.5);
 
     connect(m_volumeSlider, &QSlider::valueChanged, this, [this](int value){
@@ -199,13 +260,15 @@ Player::Player(QWidget *parent)
 
     QLabel *volumeLabel = new QLabel("🔊", this);
     volumeLabel->setAlignment(Qt::AlignCenter);
-    volumeLabel->setFixedWidth(20);
+    volumeLabel->setFixedWidth(22);
 
     // --- Controls layout ---
     auto *controlsLayout = new QHBoxLayout;
+    controlsLayout->setContentsMargins(4, 2, 4, 4);
+    controlsLayout->setSpacing(6);
     controlsLayout->addWidget(volumeLabel);
     controlsLayout->addWidget(m_volumeSlider);
-    controlsLayout->addSpacing(10);
+    controlsLayout->addStretch();
     controlsLayout->addWidget(m_btnGoToStart);
     controlsLayout->addWidget(m_btnSetStart);
     controlsLayout->addWidget(m_btnPrevFrame);
@@ -214,11 +277,16 @@ Player::Player(QWidget *parent)
     controlsLayout->addWidget(m_btnSetEnd);
     controlsLayout->addWidget(m_btnStop);
     controlsLayout->addStretch();
+    controlsLayout->addWidget(m_btnLast30s);
+    controlsLayout->addWidget(m_btn30sHere);
+    controlsLayout->addWidget(m_btnFullClip);
 
     // --- Main layout ---
     auto *mainLayout = new QVBoxLayout(this);
     mainLayout->setContentsMargins(0, 0, 0, 0);
+    mainLayout->setSpacing(4);
     mainLayout->addWidget(videoContainer, 1);
+    mainLayout->addLayout(timeLayout);
     mainLayout->addWidget(m_timeline);
     mainLayout->addLayout(controlsLayout);
     setLayout(mainLayout);
@@ -228,13 +296,27 @@ Player::Player(QWidget *parent)
 
     updateControlsEnabled(false);
 
-    connect(m_timeline, &TimelineWidget::startPositionChanged, this, [this](qint64){
-        emit trimChanged(m_timeline->startPosition(), m_timeline->endPosition());
+    connect(m_timeline, &TimelineWidget::rangeChanged, this, [this](qint64 start, qint64 end){
+        updateTimeLabels();
+        emit trimChanged(start, end);
     });
+}
 
-    connect(m_timeline, &TimelineWidget::endPositionChanged, this, [this](qint64){
-        emit trimChanged(m_timeline->startPosition(), m_timeline->endPosition());
-    });
+void Player::updateTimeLabels()
+{
+    const qint64 dur = m_timeline->duration();
+    const qint64 start = m_timeline->startPosition();
+    const qint64 end = m_timeline->endPosition();
+    const qint64 pos = m_timeline->playPosition();
+    const double clipSec = qMax<qint64>(0, end - start) / 1000.0;
+
+    m_inTimeLabel->setText("In: " + formatTimestamp(start));
+    m_outTimeLabel->setText("Out: " + formatTimestamp(end));
+    m_currentTimeLabel->setText(
+        QString("%1 / %2  •  Clip: %3s")
+            .arg(formatTimestamp(pos))
+            .arg(formatTimestamp(dur))
+            .arg(clipSec, 0, 'f', 1));
 }
 
 void Player::checkVideoTrackLoaded(int generation)
@@ -257,7 +339,7 @@ void Player::resizeEvent(QResizeEvent *event)
     QWidget::resizeEvent(event);
     if (m_overlay) {
         m_overlay->setGeometry(m_overlay->parentWidget()->rect());
-        m_overlay->raise(); // Re-force to top whenever resized
+        m_overlay->raise();
     }
 }
 
@@ -272,6 +354,9 @@ void Player::updateControlsEnabled(bool enabled)
     m_btnSetEnd->setEnabled(enabled);
     m_btnNextFrame->setEnabled(enabled);
     m_btnStop->setEnabled(enabled);
+    m_btnLast30s->setEnabled(enabled);
+    m_btn30sHere->setEnabled(enabled);
+    m_btnFullClip->setEnabled(enabled);
     m_timeline->setEnabled(enabled);
 }
 
@@ -282,6 +367,10 @@ void Player::setExternalDuration(qint64 durationMs)
 
     m_timeline->setDuration(durationMs);
     m_timeline->setEnabled(true);
+    m_btnLast30s->setEnabled(true);
+    m_btn30sHere->setEnabled(true);
+    m_btnFullClip->setEnabled(true);
+    updateTimeLabels();
     emit trimChanged(m_timeline->startPosition(), m_timeline->endPosition());
 }
 
@@ -307,9 +396,25 @@ void Player::setOverlayStatus(const QString &text, bool clickable)
 
 // ----------------- Playback helpers -----------------
 
+void Player::togglePlayPause()
+{
+    if (!m_hasMedia)
+        return;
+
+    if (m_player->playbackState() == QMediaPlayer::PlayingState) {
+        pause();
+    } else {
+        if (m_reachedTrimEnd) {
+            m_player->setPosition(m_timeline->startPosition());
+            m_reachedTrimEnd = false;
+        }
+        play();
+    }
+}
+
 void Player::play()
 {
-    m_overlay->hide();   // hide the clickable text while playing
+    m_overlay->hide();
     m_player->play();
     m_btnPlayPause->setIcon(style()->standardIcon(QStyle::SP_MediaPause));
 }
@@ -329,9 +434,9 @@ void Player::pause()
 void Player::stop()
 {
     m_player->stop();
-    m_overlay->setText("Click to select video");
+    m_overlay->setText("Drop a video here or click to select\nMP4 • MKV • WebM • AVI • MOV");
     m_overlay->setClickable(true);
-    m_overlay->show();   // just the text is visible
+    m_overlay->show();
     m_btnPlayPause->setIcon(style()->standardIcon(QStyle::SP_MediaPlay));
     m_reachedTrimEnd = false;
 }
@@ -341,32 +446,89 @@ void Player::goToStart()
     pause();
     m_reachedTrimEnd = false;
     m_player->setPosition(m_timeline->startPosition());
+    m_timeline->setPlayPosition(m_timeline->startPosition());
+    updateTimeLabels();
 }
 
 void Player::stepFrameBackward()
 {
+    if (!m_hasMedia)
+        return;
     pause();
     qint64 pos = m_player->position() - m_frameStepMs;
     pos = qMax(pos, m_timeline->startPosition());
     m_player->setPosition(pos);
+    m_timeline->setPlayPosition(pos);
+    updateTimeLabels();
 }
 
 void Player::stepFrameForward()
 {
+    if (!m_hasMedia)
+        return;
     pause();
     qint64 pos = m_player->position() + m_frameStepMs;
     pos = qMin(pos, m_timeline->endPosition());
     m_player->setPosition(pos);
+    m_timeline->setPlayPosition(pos);
+    updateTimeLabels();
 }
 
 void Player::markStartAtCurrentFrame()
 {
+    if (!m_hasMedia)
+        return;
     m_timeline->setStartPosition(m_player->position());
 }
 
 void Player::markEndAtCurrentFrame()
 {
+    if (!m_hasMedia)
+        return;
     m_timeline->setEndPosition(m_player->position());
+}
+
+void Player::selectLast30Seconds()
+{
+    const qint64 dur = m_timeline->duration();
+    if (dur <= 0)
+        return;
+    const qint64 start = qMax<qint64>(0, dur - CLIP_WINDOW_30S_MS);
+    m_reachedTrimEnd = false;
+    m_timeline->setTrimRange(start, dur);
+    if (m_hasMedia) {
+        m_player->setPosition(start);
+    }
+}
+
+void Player::select30SecondsFromHere()
+{
+    const qint64 dur = m_timeline->duration();
+    if (dur <= 0)
+        return;
+    qint64 start = m_hasMedia ? m_player->position() : m_timeline->playPosition();
+    qint64 end = start + CLIP_WINDOW_30S_MS;
+    if (end > dur) {
+        end = dur;
+        start = qMax<qint64>(0, dur - CLIP_WINDOW_30S_MS);
+    }
+    m_reachedTrimEnd = false;
+    m_timeline->setTrimRange(start, end);
+    if (m_hasMedia) {
+        m_player->setPosition(start);
+    }
+}
+
+void Player::selectFullVideo()
+{
+    const qint64 dur = m_timeline->duration();
+    if (dur <= 0)
+        return;
+    m_reachedTrimEnd = false;
+    m_timeline->setTrimRange(0, dur);
+    if (m_hasMedia) {
+        m_player->setPosition(0);
+    }
 }
 
 // ----------------- Source -----------------
@@ -374,6 +536,7 @@ void Player::markEndAtCurrentFrame()
 void Player::clearSource()
 {
     ++m_loadGeneration;
+    m_hasMedia = false;
     m_autoPlayPending = false;
     m_reachedTrimEnd = false;
     m_usingProxy = false;

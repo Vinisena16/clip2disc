@@ -21,6 +21,10 @@
 #include <QPushButton>
 #include <QLabel>
 #include <QHBoxLayout>
+#include <QShortcut>
+#include <QDragEnterEvent>
+#include <QDropEvent>
+#include <QMimeData>
 #include <cmath>
 
 namespace {
@@ -71,11 +75,30 @@ MainWindow::MainWindow(QWidget *parent)
     , m_proxyProcess(new QProcess(this))
 {
     ui->setupUi(this);
+    setAcceptDrops(true);
+    setWindowTitle("Clip2Disc");
+
+    // Let the player region expand cleanly while header & footer stay compact
+    ui->verticalLayout->setStretch(0, 0);
+    ui->verticalLayout->setStretch(1, 1);
+    ui->verticalLayout->setStretch(2, 0);
+    ui->verticalLayout->setSpacing(8);
 
     // Give the right sidebar enough room for codec, encoder, and Discord fit controls
-    ui->videoDetails->setMinimumWidth(200);
-    ui->videoDetails->setMaximumWidth(230);
+    ui->videoDetails->setMinimumWidth(235);
+    ui->videoDetails->setMaximumWidth(260);
+    ui->videoDetails->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Expanding);
+    ui->verticalLayout_3->setSpacing(6);
+    ui->verticalLayout_3->setContentsMargins(12, 12, 12, 12);
+
+    ui->inputLabel->setFixedHeight(30);
+    ui->outputLabel->setFixedHeight(30);
+    ui->progressBar->setFixedHeight(26);
     ui->progressBar->setTextVisible(true);
+    ui->startButton->setMinimumWidth(110);
+    ui->startButton->setFixedHeight(30);
+    ui->inputButton->setFixedHeight(30);
+    ui->outputButton->setFixedHeight(30);
 
     // Add Encoder selector + Discord Auto-fit buttons to sidebar
     auto *encoderLabel = new QLabel("Encoder", ui->videoDetails);
@@ -87,10 +110,12 @@ MainWindow::MainWindow(QWidget *parent)
     fitRow->setSpacing(6);
 
     m_fit10MbButton = new QPushButton("<10 MB", ui->videoDetails);
+    m_fit10MbButton->setObjectName("fitButton");
     m_fit10MbButton->setToolTip("Automatically adjust bitrate to fit under 10 MB (~9.3 MB)");
     m_fit10MbButton->setEnabled(false);
 
     m_fit20MbButton = new QPushButton("<20 MB", ui->videoDetails);
+    m_fit20MbButton->setObjectName("fitButton");
     m_fit20MbButton->setToolTip("Automatically adjust bitrate to fit under 20 MB (~18.8 MB)");
     m_fit20MbButton->setEnabled(false);
 
@@ -99,8 +124,10 @@ MainWindow::MainWindow(QWidget *parent)
 
     ui->verticalLayout_3->addWidget(encoderLabel);
     ui->verticalLayout_3->addWidget(m_encoderCombo);
+    ui->verticalLayout_3->addSpacing(4);
     ui->verticalLayout_3->addWidget(fitLabel);
     ui->verticalLayout_3->addLayout(fitRow);
+    ui->verticalLayout_3->addStretch();
 
     // Ensure videoContainer has a layout
     if (!ui->videoContainer->layout()) {
@@ -111,6 +138,9 @@ MainWindow::MainWindow(QWidget *parent)
     // Create the player INSIDE the container
     m_player = new Player(ui->videoContainer);
     ui->videoContainer->layout()->addWidget(m_player);
+
+    applyModernTheme();
+    setupShortcuts();
 
     connect(m_player, &Player::requestOpenFile,
             this, &MainWindow::selectInputFile);
@@ -241,6 +271,252 @@ MainWindow::~MainWindow()
     }
     cleanupPreviewProxy();
     delete ui;
+}
+
+void MainWindow::applyModernTheme()
+{
+    // Discord-inspired dark theme
+    setStyleSheet(R"(
+        QMainWindow, QWidget#centralwidget {
+            background-color: #1E1F22;
+            color: #F2F3F5;
+            font-family: "Segoe UI", "Inter", sans-serif;
+            font-size: 13px;
+        }
+        QFrame#videoDetails, QFrame#frame_2 {
+            background-color: #2B2D31;
+            border: 1px solid #383A40;
+            border-radius: 10px;
+        }
+        QWidget#videoContainer {
+            background-color: #2B2D31;
+            border: 1px solid #383A40;
+            border-radius: 10px;
+            padding: 8px;
+        }
+        QLabel {
+            color: #DBDEE1;
+            background: transparent;
+        }
+        QLabel#codecLabel {
+            color: #949BA4;
+            font-weight: 600;
+            font-size: 12px;
+        }
+        QLabel#durationLabel {
+            color: #F2F3F5;
+            font-weight: 600;
+        }
+        QLabel#fileSizeLabel {
+            font-weight: 700;
+            font-size: 13px;
+            padding: 4px 8px;
+            border-radius: 6px;
+            background-color: #1E1F22;
+        }
+        QLabel#timeBadge {
+            color: #B5BAC1;
+            font-family: "Consolas", "Cascadia Mono", monospace;
+            font-size: 12px;
+            padding: 2px 6px;
+            background-color: #1E1F22;
+            border-radius: 4px;
+        }
+        QLabel#timeCurrent {
+            color: #F2F3F5;
+            font-family: "Consolas", "Cascadia Mono", monospace;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        QPlainTextEdit {
+            background-color: #1E1F22;
+            color: #DBDEE1;
+            border: 1px solid #3F4147;
+            border-radius: 6px;
+            padding: 4px 8px;
+        }
+        QComboBox {
+            background-color: #1E1F22;
+            color: #F2F3F5;
+            border: 1px solid #3F4147;
+            border-radius: 6px;
+            padding: 5px 10px;
+            min-height: 20px;
+        }
+        QComboBox:hover {
+            border-color: #5865F2;
+        }
+        QComboBox::drop-down {
+            border: none;
+            width: 22px;
+        }
+        QComboBox QAbstractItemView {
+            background-color: #2B2D31;
+            color: #F2F3F5;
+            selection-background-color: #5865F2;
+            border: 1px solid #3F4147;
+        }
+        QPushButton {
+            background-color: #383A40;
+            color: #F2F3F5;
+            border: 1px solid #4E5058;
+            border-radius: 6px;
+            padding: 5px 10px;
+            font-weight: 600;
+        }
+        QPushButton:hover {
+            background-color: #474A52;
+            border-color: #6D707A;
+        }
+        QPushButton:pressed {
+            background-color: #313338;
+        }
+        QPushButton:disabled {
+            background-color: #26272B;
+            color: #5C5F66;
+            border-color: #313338;
+        }
+        QPushButton#startButton, QPushButton#playPauseButton {
+            background-color: #5865F2;
+            color: #FFFFFF;
+            border: none;
+        }
+        QPushButton#startButton:hover, QPushButton#playPauseButton:hover {
+            background-color: #4752C4;
+        }
+        QPushButton#startButton:pressed, QPushButton#playPauseButton:pressed {
+            background-color: #3C45A5;
+        }
+        QPushButton#startButton:disabled, QPushButton#playPauseButton:disabled {
+            background-color: #3A3F73;
+            color: #949BA4;
+        }
+        QPushButton#fitButton {
+            background-color: #248046;
+            color: #FFFFFF;
+            border: none;
+            padding: 6px 8px;
+        }
+        QPushButton#fitButton:hover {
+            background-color: #1A6334;
+        }
+        QPushButton#fitButton:disabled {
+            background-color: #26272B;
+            color: #5C5F66;
+        }
+        QPushButton#presetButton {
+            background-color: #313338;
+            color: #DBDEE1;
+            border: 1px solid #4E5058;
+            padding: 4px 9px;
+            font-size: 12px;
+        }
+        QPushButton#presetButton:hover {
+            background-color: #5865F2;
+            color: #FFFFFF;
+            border-color: #5865F2;
+        }
+        QPushButton#aboutButton {
+            background: transparent;
+            border: none;
+            color: #B5BAC1;
+            font-size: 16px;
+        }
+        QPushButton#aboutButton:hover {
+            color: #FFFFFF;
+            background-color: #383A40;
+        }
+        QSlider::groove:horizontal {
+            height: 6px;
+            background: #1E1F22;
+            border-radius: 3px;
+        }
+        QSlider::sub-page:horizontal {
+            background: #5865F2;
+            border-radius: 3px;
+        }
+        QSlider::handle:horizontal {
+            background: #F2F3F5;
+            width: 14px;
+            height: 14px;
+            margin: -4px 0;
+            border-radius: 7px;
+        }
+        QSlider::handle:horizontal:hover {
+            background: #FFFFFF;
+        }
+        QSlider::handle:horizontal:disabled {
+            background: #4E5058;
+        }
+        QProgressBar {
+            background-color: #1E1F22;
+            border: 1px solid #3F4147;
+            border-radius: 6px;
+            text-align: center;
+            color: #F2F3F5;
+            font-weight: 600;
+        }
+        QProgressBar::chunk {
+            background-color: #5865F2;
+            border-radius: 5px;
+        }
+        QStatusBar, QMenuBar {
+            background-color: #1E1F22;
+            color: #949BA4;
+        }
+        QToolTip {
+            background-color: #111214;
+            color: #F2F3F5;
+            border: 1px solid #3F4147;
+            padding: 4px 8px;
+            border-radius: 4px;
+        }
+    )");
+}
+
+void MainWindow::setupShortcuts()
+{
+    auto addShortcut = [this](const QKeySequence &key, auto slot) {
+        auto *sc = new QShortcut(key, this);
+        sc->setContext(Qt::WindowShortcut);
+        connect(sc, &QShortcut::activated, m_player, slot);
+    };
+
+    addShortcut(QKeySequence(Qt::Key_Space), &Player::togglePlayPause);
+    addShortcut(QKeySequence(Qt::Key_Left),  &Player::stepFrameBackward);
+    addShortcut(QKeySequence(Qt::Key_Right), &Player::stepFrameForward);
+    addShortcut(QKeySequence(Qt::Key_I),     &Player::markStartAtCurrentFrame);
+    addShortcut(QKeySequence(Qt::Key_O),     &Player::markEndAtCurrentFrame);
+    addShortcut(QKeySequence(Qt::Key_Home),  &Player::goToStart);
+}
+
+void MainWindow::dragEnterEvent(QDragEnterEvent *event)
+{
+    if (event->mimeData()->hasUrls()) {
+        for (const QUrl &url : event->mimeData()->urls()) {
+            const QString ext = QFileInfo(url.toLocalFile()).suffix().toLower();
+            if (ext == "mp4" || ext == "mkv" || ext == "webm" || ext == "avi" || ext == "mov") {
+                event->acceptProposedAction();
+                return;
+            }
+        }
+    }
+}
+
+void MainWindow::dropEvent(QDropEvent *event)
+{
+    if (!event->mimeData()->hasUrls())
+        return;
+
+    for (const QUrl &url : event->mimeData()->urls()) {
+        const QString path = url.toLocalFile();
+        const QString ext = QFileInfo(path).suffix().toLower();
+        if (ext == "mp4" || ext == "mkv" || ext == "webm" || ext == "avi" || ext == "mov") {
+            loadInputFile(path);
+            event->acceptProposedAction();
+            return;
+        }
+    }
 }
 
 bool MainWindow::testVideoEncoder(const QString &encoderName)
@@ -600,9 +876,20 @@ void MainWindow::updateEstimatedFileSize()
         (totalBitrateKbps * durationSec) / (8.0 * 1024.0);
 
     ui->fileSizeLabel->setText(
-        QString("File size: ~%1 MB")
+        QString("Est. size: ~%1 MB")
             .arg(sizeMB, 0, 'f', 1)
         );
+
+    if (sizeMB <= 10.0) {
+        ui->fileSizeLabel->setStyleSheet(
+            "color: #23A55A; font-weight: 700; padding: 4px 8px; border-radius: 6px; background-color: #1E1F22;");
+    } else if (sizeMB <= 20.0) {
+        ui->fileSizeLabel->setStyleSheet(
+            "color: #7983F5; font-weight: 700; padding: 4px 8px; border-radius: 6px; background-color: #1E1F22;");
+    } else {
+        ui->fileSizeLabel->setStyleSheet(
+            "color: #F23F43; font-weight: 700; padding: 4px 8px; border-radius: 6px; background-color: #1E1F22;");
+    }
 }
 
 void MainWindow::fitToDiscordLimit(double targetSizeMB)
@@ -710,8 +997,6 @@ void MainWindow::autoAdjustVideoBitrateForResolution()
 
 void MainWindow::selectInputFile()
 {
-    m_userAdjustedVideoBitrate = false;
-
     QString selected = QFileDialog::getOpenFileName(
         this,
         "Select Video File",
@@ -721,6 +1006,16 @@ void MainWindow::selectInputFile()
 
     if (selected.isEmpty())
         return;
+
+    loadInputFile(selected);
+}
+
+void MainWindow::loadInputFile(const QString &selected)
+{
+    if (selected.isEmpty() || !QFile::exists(selected))
+        return;
+
+    m_userAdjustedVideoBitrate = false;
 
     // Cancel any previous preview proxy generation
     if (m_proxyProcess->state() != QProcess::NotRunning) {
@@ -1115,10 +1410,16 @@ void MainWindow::onEncodingFinished(int exitCode, QProcess::ExitStatus exitStatu
     if (exitStatus == QProcess::NormalExit && exitCode == 0) {
         ui->progressBar->setValue(100);
         const double sizeMB = QFileInfo(outputFilePath).size() / (1024.0 * 1024.0);
-        QMessageBox::information(
-            this,
-            "Finished",
-            QString("Video compressed!\nFinal size: %1 MB").arg(sizeMB, 0, 'f', 2));
+        QMessageBox msg(this);
+        msg.setIcon(QMessageBox::Information);
+        msg.setWindowTitle("Finished");
+        msg.setText(QString("Video compressed!\nFinal size: %1 MB").arg(sizeMB, 0, 'f', 2));
+        QPushButton *openFolderBtn = msg.addButton("Open Folder", QMessageBox::ActionRole);
+        msg.addButton(QMessageBox::Ok);
+        msg.exec();
+        if (msg.clickedButton() == openFolderBtn) {
+            QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(outputFilePath).absolutePath()));
+        }
     } else {
         ui->progressBar->setValue(0);
         QString details = m_ffmpegErrorLog.trimmed();

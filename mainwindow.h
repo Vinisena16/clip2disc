@@ -24,8 +24,13 @@ public:
     explicit MainWindow(QWidget *parent = nullptr);
     ~MainWindow();
 
+protected:
+    void dragEnterEvent(QDragEnterEvent *event) override;
+    void dropEvent(QDropEvent *event) override;
+
 private slots:
     void selectInputFile();
+    void loadInputFile(const QString &filePath);
     void selectOutputFile();
     void startEncoding();
     void updateProgress();
@@ -41,6 +46,8 @@ private slots:
 
 private:
     // -------- Helpers --------
+    void applyModernTheme();
+    void setupShortcuts();
     VideoInfo probeVideo(const QString &filePath);
     bool initializeBinaryPaths();
     void detectAvailableEncoders();
