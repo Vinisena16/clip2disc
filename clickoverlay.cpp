@@ -56,9 +56,23 @@ void ClickOverlay::showText(bool visible)
         m_label->setVisible(visible);
 }
 
+void ClickOverlay::setText(const QString &text)
+{
+    if (m_label)
+        m_label->setText(text);
+}
+
+void ClickOverlay::setClickable(bool clickable)
+{
+    m_clickable = clickable;
+}
+
 // emit click signal
 void ClickOverlay::mousePressEvent(QMouseEvent *event)
 {
+    Q_UNUSED(event);
+    if (!m_clickable)
+        return;
     qDebug() << "Overlay clicked";
     emit clicked();
 }

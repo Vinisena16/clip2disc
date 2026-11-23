@@ -58,6 +58,7 @@ void TimelineWidget::setEndPosition(qint64 positionMs)
     update();
 }
 
+qint64 TimelineWidget::duration() const { return m_duration; }
 qint64 TimelineWidget::startPosition() const { return m_start; }
 qint64 TimelineWidget::endPosition() const { return m_end; }
 

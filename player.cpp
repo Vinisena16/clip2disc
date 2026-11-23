@@ -5,6 +5,8 @@
 #include <QMediaPlayer>
 #include <QAudioOutput>
 #include <QVideoWidget>
+#include <QVideoSink>
+#include <QVideoFrame>
 #include <QPushButton>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -12,11 +14,14 @@
 #include <QStyle>
 #include <QLabel>
 #include <QTimer>
+#include <QDebug>
+#include <QtMath>
 
-static constexpr qint64 FRAME_STEP_MS = 40; // ~25fps fallback
+static constexpr qint64 DEFAULT_FRAME_STEP_MS = 40; // ~25fps fallback
 
 Player::Player(QWidget *parent)
     : QWidget(parent)
+    , m_frameStepMs(DEFAULT_FRAME_STEP_MS)
 {
     // --- Media objects ---
     m_player = new QMediaPlayer(this);
@@ -27,6 +32,15 @@ Player::Player(QWidget *parent)
     m_videoWidget = new QVideoWidget(this);
     m_videoWidget->setStyleSheet("background-color: black;");
     m_player->setVideoOutput(m_videoWidget);
+
+    if (auto *sink = m_videoWidget->videoSink()) {
+        connect(sink, &QVideoSink::videoFrameChanged,
+                this, [this](const QVideoFrame &frame) {
+                    if (frame.isValid()) {
+                        m_receivedFrame = true;
+                    }
+                });
+    }
 
     // --- Video container ---
     auto *videoContainer = new QWidget(this);
@@ -46,17 +60,67 @@ Player::Player(QWidget *parent)
     m_timeline->setEnabled(false);
 
     connect(m_player, &QMediaPlayer::durationChanged,
-            m_timeline, &TimelineWidget::setDuration);
+            this, [this](qint64 durationMs) {
+                if (durationMs <= 0)
+                    return;
+                // Keep ffprobe-provided duration & user trim marks when swapping in a proxy
+                if (m_usingProxy && m_timeline->duration() > 0)
+                    return;
+                if (m_timeline->duration() <= 0) {
+                    m_timeline->setDuration(durationMs);
+                    emit trimChanged(m_timeline->startPosition(), m_timeline->endPosition());
+                }
+            });
+
+    connect(m_player, &QMediaPlayer::errorOccurred,
+            this, [this](QMediaPlayer::Error error, const QString &errorString) {
+                if (error == QMediaPlayer::NoError)
+                    return;
+
+                qWarning() << "QMediaPlayer error:" << error << errorString;
+                m_autoPlayPending = false;
+
+                if (!m_usingProxy && !m_failureReported) {
+                    m_failureReported = true;
+                    emit playbackFailed(errorString.isEmpty()
+                                            ? QString("Media playback error (%1)").arg(int(error))
+                                            : errorString);
+                } else {
+                    setOverlayStatus("Preview unavailable (you can still trim & compress)", false);
+                }
+            });
 
     connect(m_player, &QMediaPlayer::mediaStatusChanged,
             this, [this](QMediaPlayer::MediaStatus status) {
+                if (status == QMediaPlayer::InvalidMedia) {
+                    m_autoPlayPending = false;
+                    if (!m_usingProxy && !m_failureReported) {
+                        m_failureReported = true;
+                        emit playbackFailed("Unsupported media format or codec");
+                    } else {
+                        setOverlayStatus("Preview unavailable (you can still trim & compress)", false);
+                    }
+                    return;
+                }
+
                 if ((status == QMediaPlayer::LoadedMedia || status == QMediaPlayer::BufferedMedia) &&
                     m_autoPlayPending) {
                     m_autoPlayPending = false;
                     m_hasMedia = true;
                     updateControlsEnabled(true);
+
                     m_player->setPosition(m_timeline->startPosition());
                     play();
+
+                    if (m_expectVideo && !m_usingProxy) {
+                        // Verify that a real decoded video frame actually arrives (catches
+                        // silent black-screen failures when Qt's bundled FFmpeg cannot
+                        // hardware-decode AV1 and has no software libdav1d fallback).
+                        const int gen = m_loadGeneration;
+                        QTimer::singleShot(1200, this, [this, gen]() {
+                            checkVideoTrackLoaded(gen);
+                        });
+                    }
                 }
             });
 
@@ -66,7 +130,7 @@ Player::Player(QWidget *parent)
                     return;
 
                 const qint64 end = m_timeline->endPosition();
-                if (m_player->playbackState() == QMediaPlayer::PlayingState && pos >= end) {
+                if (m_player->playbackState() == QMediaPlayer::PlayingState && end > 0 && pos >= end) {
                     m_player->pause();
                     m_player->setPosition(end);
                     m_reachedTrimEnd = true;
@@ -77,7 +141,10 @@ Player::Player(QWidget *parent)
             });
 
     connect(m_timeline, &TimelineWidget::playPositionChanged,
-            this, [this](qint64 pos) { m_player->setPosition(pos); });
+            this, [this](qint64 pos) {
+                m_reachedTrimEnd = false;
+                m_player->setPosition(pos);
+            });
 
     // --- Buttons ---
     m_btnGoToStart = new QPushButton(this);
@@ -100,7 +167,6 @@ Player::Player(QWidget *parent)
 
     m_btnStop = new QPushButton(this);
     m_btnStop->setIcon(style()->standardIcon(QStyle::SP_MediaStop));
-
 
     connect(m_btnGoToStart, &QPushButton::clicked, this, &Player::goToStart);
     connect(m_btnPrevFrame, &QPushButton::clicked, this, &Player::stepFrameBackward);
@@ -171,6 +237,21 @@ Player::Player(QWidget *parent)
     });
 }
 
+void Player::checkVideoTrackLoaded(int generation)
+{
+    if (generation != m_loadGeneration || m_usingProxy || m_failureReported)
+        return;
+
+    if (!m_player->hasVideo() || !m_receivedFrame) {
+        qWarning() << "QMediaPlayer produced no video frames (hasVideo=" << m_player->hasVideo()
+                   << "receivedFrame=" << m_receivedFrame << "); requesting proxy fallback";
+        m_player->stop();
+        m_failureReported = true;
+        emit playbackFailed("Video codec not supported by preview player");
+        return;
+    }
+}
+
 void Player::resizeEvent(QResizeEvent *event)
 {
     QWidget::resizeEvent(event);
@@ -194,6 +275,36 @@ void Player::updateControlsEnabled(bool enabled)
     m_timeline->setEnabled(enabled);
 }
 
+void Player::setExternalDuration(qint64 durationMs)
+{
+    if (durationMs <= 0)
+        return;
+
+    m_timeline->setDuration(durationMs);
+    m_timeline->setEnabled(true);
+    emit trimChanged(m_timeline->startPosition(), m_timeline->endPosition());
+}
+
+void Player::setFrameRate(double fps)
+{
+    if (fps > 0.5 && fps <= 240.0) {
+        m_frameStepMs = qMax<qint64>(1, qRound64(1000.0 / fps));
+    } else {
+        m_frameStepMs = DEFAULT_FRAME_STEP_MS;
+    }
+}
+
+void Player::setOverlayStatus(const QString &text, bool clickable)
+{
+    if (!m_overlay)
+        return;
+    m_overlay->setText(text);
+    m_overlay->setClickable(clickable);
+    m_overlay->showText(true);
+    m_overlay->show();
+    m_overlay->raise();
+}
+
 // ----------------- Playback helpers -----------------
 
 void Player::play()
@@ -202,9 +313,6 @@ void Player::play()
     m_player->play();
     m_btnPlayPause->setIcon(style()->standardIcon(QStyle::SP_MediaPause));
 }
-
-
-
 
 void Player::pause()
 {
@@ -218,15 +326,15 @@ void Player::pause()
         );
 }
 
-
 void Player::stop()
 {
     m_player->stop();
+    m_overlay->setText("Click to select video");
+    m_overlay->setClickable(true);
     m_overlay->show();   // just the text is visible
     m_btnPlayPause->setIcon(style()->standardIcon(QStyle::SP_MediaPlay));
     m_reachedTrimEnd = false;
 }
-
 
 void Player::goToStart()
 {
@@ -238,7 +346,7 @@ void Player::goToStart()
 void Player::stepFrameBackward()
 {
     pause();
-    qint64 pos = m_player->position() - FRAME_STEP_MS;
+    qint64 pos = m_player->position() - m_frameStepMs;
     pos = qMax(pos, m_timeline->startPosition());
     m_player->setPosition(pos);
 }
@@ -246,7 +354,7 @@ void Player::stepFrameBackward()
 void Player::stepFrameForward()
 {
     pause();
-    qint64 pos = m_player->position() + FRAME_STEP_MS;
+    qint64 pos = m_player->position() + m_frameStepMs;
     pos = qMin(pos, m_timeline->endPosition());
     m_player->setPosition(pos);
 }
@@ -263,21 +371,59 @@ void Player::markEndAtCurrentFrame()
 
 // ----------------- Source -----------------
 
+void Player::clearSource()
+{
+    ++m_loadGeneration;
+    m_autoPlayPending = false;
+    m_reachedTrimEnd = false;
+    m_usingProxy = false;
+    m_failureReported = false;
+    m_receivedFrame = false;
+    m_player->stop();
+    m_player->setSource(QUrl());
+}
+
 void Player::setSource(const QUrl &url)
 {
+    ++m_loadGeneration;
     m_autoPlayPending = true;
     m_reachedTrimEnd = false;
+    m_expectVideo = true;
+    m_usingProxy = false;
+    m_failureReported = false;
+    m_receivedFrame = false;
     m_player->setSource(url);
     m_overlay->hide();
 }
 
-void Player::setSourceFile(const QString &filePath)
+void Player::setSourceFile(const QString &filePath, bool expectVideo)
 {
     if (filePath.isEmpty())
         return;
 
+    ++m_loadGeneration;
     m_autoPlayPending = true;
     m_reachedTrimEnd = false;
+    m_expectVideo = expectVideo;
+    m_usingProxy = false;
+    m_failureReported = false;
+    m_receivedFrame = false;
+    m_player->setSource(QUrl::fromLocalFile(filePath));
+    m_overlay->hide();
+}
+
+void Player::setPreviewSourceFile(const QString &filePath)
+{
+    if (filePath.isEmpty())
+        return;
+
+    ++m_loadGeneration;
+    m_autoPlayPending = true;
+    m_reachedTrimEnd = false;
+    m_expectVideo = true;
+    m_usingProxy = true;
+    m_failureReported = false;
+    m_receivedFrame = false;
     m_player->setSource(QUrl::fromLocalFile(filePath));
     m_overlay->hide();
 }

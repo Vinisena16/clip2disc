@@ -12,17 +12,82 @@
 #include <QTimer>
 #include <QCoreApplication>
 #include <QDir>
+#include <QFileInfo>
 #include <QProcess>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
+#include <QComboBox>
+#include <QPushButton>
+#include <QLabel>
+#include <cmath>
+
+namespace {
+
+double parseRationalFps(const QString &fpsStr)
+{
+    if (!fpsStr.contains('/'))
+        return 0.0;
+    const auto parts = fpsStr.split('/');
+    const double num = parts.value(0).toDouble();
+    const double den = parts.value(1).toDouble();
+    if (den <= 0.0)
+        return 0.0;
+    return num / den;
+}
+
+qint64 parseBitrateKbps(const QJsonObject &obj)
+{
+    if (obj.contains("bit_rate")) {
+        bool ok = false;
+        const qint64 bps = obj["bit_rate"].toString().toLongLong(&ok);
+        if (ok && bps > 0)
+            return bps / 1000;
+    }
+
+    // MKV / WebM streams frequently store bitrate in tags.BPS instead of bit_rate
+    if (obj.contains("tags")) {
+        const QJsonObject tags = obj["tags"].toObject();
+        for (const QString &key : {QStringLiteral("BPS"), QStringLiteral("BPS-eng")}) {
+            if (tags.contains(key)) {
+                bool ok = false;
+                const qint64 bps = tags[key].toString().toLongLong(&ok);
+                if (ok && bps > 0)
+                    return bps / 1000;
+            }
+        }
+    }
+
+    return 0;
+}
+
+} // namespace
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
     , ui(new Ui::MainWindow)
     , ffmpegProcess(new QProcess(this))
+    , m_proxyProcess(new QProcess(this))
 {
     ui->setupUi(this);
+
+    // Give the right sidebar enough room for codec, encoder, and Discord fit controls
+    ui->videoDetails->setMinimumWidth(200);
+    ui->videoDetails->setMaximumWidth(230);
+    ui->progressBar->setTextVisible(true);
+
+    // Add Encoder selector + Discord Auto-fit button to sidebar
+    auto *encoderLabel = new QLabel("Encoder", ui->videoDetails);
+    m_encoderCombo = new QComboBox(ui->videoDetails);
+    m_encoderCombo->setEnabled(false);
+
+    m_fitDiscordButton = new QPushButton("Auto-fit <10 MB", ui->videoDetails);
+    m_fitDiscordButton->setToolTip("Automatically adjust bitrate to fit under Discord's 10 MB limit");
+    m_fitDiscordButton->setEnabled(false);
+
+    ui->verticalLayout_3->addWidget(encoderLabel);
+    ui->verticalLayout_3->addWidget(m_encoderCombo);
+    ui->verticalLayout_3->addWidget(m_fitDiscordButton);
 
     // Ensure videoContainer has a layout
     if (!ui->videoContainer->layout()) {
@@ -36,6 +101,8 @@ MainWindow::MainWindow(QWidget *parent)
 
     connect(m_player, &Player::requestOpenFile,
             this, &MainWindow::selectInputFile);
+    connect(m_player, &Player::playbackFailed,
+            this, &MainWindow::onPlaybackFailed);
 
     qDebug() << "Application started";
     qDebug() << "App dir:" << QCoreApplication::applicationDirPath();
@@ -44,13 +111,28 @@ MainWindow::MainWindow(QWidget *parent)
     connect(ui->outputButton, &QPushButton::clicked, this, &MainWindow::selectOutputFile);
     connect(ui->startButton, &QPushButton::clicked, this, &MainWindow::startEncoding);
     connect(ui->aboutButton, &QPushButton::clicked, this, &MainWindow::showAboutDialog);
-    connect(ffmpegProcess, &QProcess::readyReadStandardOutput, this, &MainWindow::updateProgress);
+    connect(m_fitDiscordButton, &QPushButton::clicked, this, &MainWindow::fitToDiscordLimit);
+
+    ffmpegProcess->setProcessChannelMode(QProcess::SeparateChannels);
+    connect(ffmpegProcess, &QProcess::readyReadStandardOutput,
+            this, &MainWindow::updateProgress);
+    connect(ffmpegProcess, &QProcess::readyReadStandardError,
+            this, &MainWindow::onEncodingErrorOutput);
+    connect(ffmpegProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+            this, &MainWindow::onEncodingFinished);
+    connect(ffmpegProcess, &QProcess::errorOccurred,
+            this, &MainWindow::onEncodingProcessError);
+
+    connect(m_proxyProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+            this, &MainWindow::onProxyFinished);
 
     if (!initializeBinaryPaths()) {
         qDebug() << "FFmpeg initialization failed";
         ui->inputButton->setEnabled(false);
         ui->outputButton->setEnabled(false);
         ui->startButton->setEnabled(false);
+    } else {
+        detectAvailableEncoders();
     }
 
     connect(ui->videoBitrateSlider, &QSlider::valueChanged,
@@ -58,19 +140,23 @@ MainWindow::MainWindow(QWidget *parent)
 
                 m_userAdjustedVideoBitrate = true;
 
-                int percent = (value * 100) / m_sourceInfo.videoBitrate;
-
-                ui->videoBitrateLabel->setText(
-                    QString("Bitrate: %1 kbps (%2%)")
-                        .arg(value)
-                        .arg(percent));
+                if (m_sourceInfo.videoBitrate > 0) {
+                    int percent = int((qint64(value) * 100) / m_sourceInfo.videoBitrate);
+                    ui->videoBitrateLabel->setText(
+                        QString("Bitrate: %1 kbps (%2%)")
+                            .arg(value)
+                            .arg(percent));
+                } else {
+                    ui->videoBitrateLabel->setText(
+                        QString("Bitrate: %1 kbps").arg(value));
+                }
 
                 updateEstimatedFileSize();
             });
 
-
     ui->videoBitrateSlider->setSingleStep(100);
     ui->videoBitrateSlider->setPageStep(500);
+    ui->videoBitrateSlider->setEnabled(false);
 
     connect(ui->fpsSlider, &QSlider::valueChanged,
             this, [this](int value) {
@@ -86,20 +172,21 @@ MainWindow::MainWindow(QWidget *parent)
     connect(ui->audioBitrateSlider, &QSlider::valueChanged,
             this, [this](int value) {
 
-                if (m_sourceInfo.audioBitrate <= 0)
-                    return;
+                if (m_sourceInfo.audioBitrate > 0) {
+                    int percent =
+                        int((qint64(value) * 100) / m_sourceInfo.audioBitrate);
 
-                int percent =
-                    (value * 100) / m_sourceInfo.audioBitrate;
-
-                ui->audioBitrateLabel->setText(
-                    QString("Audio bitrate: %1 kbps (%2%)")
-                        .arg(value)
-                        .arg(percent));
+                    ui->audioBitrateLabel->setText(
+                        QString("Audio bitrate: %1 kbps (%2%)")
+                            .arg(value)
+                            .arg(percent));
+                } else {
+                    ui->audioBitrateLabel->setText(
+                        QString("Audio bitrate: %1 kbps").arg(value));
+                }
 
                 updateEstimatedFileSize();
             });
-
 
     ui->audioBitrateSlider->setSingleStep(16);
     ui->audioBitrateSlider->setPageStep(64);
@@ -114,7 +201,6 @@ MainWindow::MainWindow(QWidget *parent)
                 updateEstimatedFileSize();
             });
 
-
     ui->resolutionCombo->setEnabled(false);
 
     connect(m_player, &Player::trimChanged,
@@ -124,12 +210,77 @@ MainWindow::MainWindow(QWidget *parent)
             this, [this](qint64, qint64) {
                 updateEstimatedFileSize();
             });
-
 }
 
 MainWindow::~MainWindow()
 {
+    if (m_proxyProcess && m_proxyProcess->state() != QProcess::NotRunning) {
+        m_proxyProcess->kill();
+        m_proxyProcess->waitForFinished(1000);
+    }
+    if (ffmpegProcess && ffmpegProcess->state() != QProcess::NotRunning) {
+        ffmpegProcess->kill();
+        ffmpegProcess->waitForFinished(1000);
+    }
+    if (m_player) {
+        m_player->clearSource();
+    }
+    cleanupPreviewProxy();
     delete ui;
+}
+
+bool MainWindow::testVideoEncoder(const QString &encoderName)
+{
+    QProcess proc;
+    proc.setProgram(ffmpegPath);
+    proc.setArguments({
+        "-hide_banner",
+        "-loglevel", "error",
+        "-f", "lavfi",
+        "-i", "color=black:s=256x256:d=0.04",
+        "-frames:v", "1",
+        "-pix_fmt", "yuv420p",
+        "-c:v", encoderName,
+        "-f", "null", "-"
+    });
+    proc.start();
+    return proc.waitForFinished(4000) && proc.exitCode() == 0;
+}
+
+void MainWindow::detectAvailableEncoders()
+{
+    m_encoderCombo->clear();
+
+    QProcess proc;
+    proc.setProgram(ffmpegPath);
+    proc.setArguments({"-hide_banner", "-encoders"});
+    proc.start();
+
+    QString encoderList;
+    if (proc.waitForFinished(3000) && proc.exitCode() == 0) {
+        encoderList = QString::fromUtf8(proc.readAllStandardOutput());
+    }
+
+    if (encoderList.contains("h264_nvenc")) {
+        m_hasH264Nvenc = testVideoEncoder("h264_nvenc");
+    }
+    if (encoderList.contains("av1_nvenc")) {
+        m_hasAv1Nvenc = testVideoEncoder("av1_nvenc");
+    }
+
+    qDebug() << "Detected hardware encoders - h264_nvenc:" << m_hasH264Nvenc
+             << "av1_nvenc:" << m_hasAv1Nvenc;
+
+    if (m_hasH264Nvenc) {
+        m_encoderCombo->addItem("H.264 (NVIDIA NVENC)", "h264_nvenc");
+    }
+    m_encoderCombo->addItem("H.264 (CPU - libx264)", "libx264");
+    if (m_hasAv1Nvenc) {
+        m_encoderCombo->addItem("AV1 (NVIDIA NVENC)", "av1_nvenc");
+    }
+
+    m_encoderCombo->setCurrentIndex(0);
+    m_encoderCombo->setEnabled(true);
 }
 
 VideoInfo MainWindow::probeVideo(const QString &filePath)
@@ -147,7 +298,7 @@ VideoInfo MainWindow::probeVideo(const QString &filePath)
     });
 
     process.start();
-    if (!process.waitForFinished(5000))
+    if (!process.waitForFinished(10000))
         return info;
 
     const QByteArray output = process.readAllStandardOutput();
@@ -162,11 +313,7 @@ VideoInfo MainWindow::probeVideo(const QString &filePath)
     const QJsonObject format = root["format"].toObject();
 
     info.duration = format["duration"].toString().toDouble();
-
-    // container bitrate (bits/sec → kbps)
-    if (format.contains("bit_rate")) {
-        info.bitrate = format["bit_rate"].toString().toLongLong() / 1000;
-    }
+    info.bitrate = parseBitrateKbps(format);
 
     // ---------- STREAMS ----------
     const QJsonArray streams = root["streams"].toArray();
@@ -175,65 +322,84 @@ VideoInfo MainWindow::probeVideo(const QString &filePath)
         const QJsonObject s = v.toObject();
         const QString type = s["codec_type"].toString();
 
-        if (type == "video") {
+        if (type == "video" && !info.hasVideo) {
+            // Skip embedded thumbnails / cover art
+            const QJsonObject disp = s["disposition"].toObject();
+            if (disp["attached_pic"].toInt() == 1)
+                continue;
+
+            info.hasVideo = true;
             info.videoCodec = s["codec_name"].toString();
+            info.pixFmt = s["pix_fmt"].toString();
             info.width  = s["width"].toInt();
             info.height = s["height"].toInt();
 
-            // FPS (e.g. "30000/1001")
-            const QString fpsStr = s["r_frame_rate"].toString();
-            if (fpsStr.contains("/")) {
-                const auto parts = fpsStr.split("/");
-                const double num = parts.value(0).toDouble();
-                const double den = parts.value(1).toDouble();
-                if (den != 0.0)
-                    info.fps = num / den;
+            // Prefer avg_frame_rate over r_frame_rate: NVIDIA ShadowPlay VFR recordings
+            // can report bogus r_frame_rate values like 90000/1 or 1000/1.
+            double fps = parseRationalFps(s["avg_frame_rate"].toString());
+            if (fps <= 0.5 || fps > 240.0) {
+                fps = parseRationalFps(s["r_frame_rate"].toString());
             }
+            if (fps <= 0.5 || fps > 240.0) {
+                fps = 30.0;
+            }
+            info.fps = fps;
 
-            // video bitrate (bits/sec → kbps)
-            if (s.contains("bit_rate")) {
-                info.videoBitrate =
-                    s["bit_rate"].toString().toLongLong() / 1000;
+            info.videoBitrate = parseBitrateKbps(s);
+
+            if (info.duration <= 0.0 && s.contains("duration")) {
+                info.duration = s["duration"].toString().toDouble();
             }
         }
-        else if (type == "audio") {
+        else if (type == "audio" && !info.hasAudio) {
+            info.hasAudio = true;
             info.audioCodec = s["codec_name"].toString();
+            info.audioBitrate = parseBitrateKbps(s);
+        }
+    }
 
-            // audio bitrate (bits/sec → kbps)
-            if (s.contains("bit_rate")) {
-                info.audioBitrate =
-                    s["bit_rate"].toString().toLongLong() / 1000;
+    // Fallback bitrate estimation for AV1 / MKV / VFR streams that omit stream bit_rate
+    if (info.hasAudio && info.audioBitrate <= 0) {
+        info.audioBitrate = 128;
+    }
+
+    if (info.hasVideo && info.videoBitrate <= 0) {
+        qint64 containerKbps = info.bitrate;
+        if (containerKbps <= 0 && info.duration > 0.0) {
+            const qint64 fileSizeBytes = QFileInfo(filePath).size();
+            if (fileSizeBytes > 0) {
+                containerKbps = qint64((double(fileSizeBytes) * 8.0) / (info.duration * 1000.0));
             }
         }
+        const qint64 audioSub = info.hasAudio ? info.audioBitrate : 0;
+        info.videoBitrate = qMax<qint64>(500, containerKbps - audioSub);
     }
 
     return info;
 }
-
-
 
 bool MainWindow::initializeBinaryPaths()
 {
     QString appDir = QCoreApplication::applicationDirPath();
     QDir binariesDir(appDir + "/binaries");
 
-    QString ffmpegPath = binariesDir.absoluteFilePath("ffmpeg");
-    QString ffprobePath = binariesDir.absoluteFilePath("ffprobe");
+    QString ffmpegCandidate = binariesDir.absoluteFilePath("ffmpeg");
+    QString ffprobeCandidate = binariesDir.absoluteFilePath("ffprobe");
 
 #ifdef Q_OS_WIN
-    ffmpegPath += ".exe";
-    ffprobePath += ".exe";
+    ffmpegCandidate += ".exe";
+    ffprobeCandidate += ".exe";
 #endif
 
     qDebug() << "Looking for FFmpeg binaries";
-    qDebug() << "ffmpeg candidate:" << ffmpegPath;
-    qDebug() << "ffprobe candidate:" << ffprobePath;
+    qDebug() << "ffmpeg candidate:" << ffmpegCandidate;
+    qDebug() << "ffprobe candidate:" << ffprobeCandidate;
 
-    bool localBinariesExist = QFile::exists(ffmpegPath) && QFile::exists(ffprobePath);
+    bool localBinariesExist = QFile::exists(ffmpegCandidate) && QFile::exists(ffprobeCandidate);
 
     if (localBinariesExist) {
-        this->ffmpegPath = ffmpegPath;
-        this->ffprobePath = ffprobePath;
+        this->ffmpegPath = ffmpegCandidate;
+        this->ffprobePath = ffprobeCandidate;
         qDebug() << "Using local FFmpeg binaries";
         return true;
     }
@@ -260,6 +426,112 @@ bool MainWindow::initializeBinaryPaths()
     return false;
 }
 
+void MainWindow::cleanupPreviewProxy()
+{
+    if (!m_previewProxyPath.isEmpty()) {
+        if (QFile::exists(m_previewProxyPath)) {
+            QFile::remove(m_previewProxyPath);
+        }
+        m_previewProxyPath.clear();
+    }
+}
+
+void MainWindow::onPlaybackFailed(const QString &reason)
+{
+    qWarning() << "Player playback failed:" << reason;
+
+    if (inputFilePath.isEmpty() || !m_sourceInfo.hasVideo)
+        return;
+
+    if (m_proxyAttempted) {
+        m_player->setOverlayStatus("Preview unavailable (you can still trim & compress)", false);
+        return;
+    }
+
+    m_proxyAttempted = true;
+    generatePreviewProxy(m_hasH264Nvenc);
+}
+
+void MainWindow::generatePreviewProxy(bool useHardware)
+{
+    if (m_proxyProcess->state() != QProcess::NotRunning) {
+        m_proxyProcess->kill();
+        m_proxyProcess->waitForFinished(1000);
+    }
+
+    m_player->clearSource();
+    cleanupPreviewProxy();
+
+    m_proxyUsedHw = useHardware;
+    m_previewProxyPath = QDir::tempPath() + QString("/clip2disc_preview_%1.mp4")
+                                                .arg(QCoreApplication::applicationPid());
+
+    m_player->setOverlayStatus(
+        QString("Generating compatible preview (%1)...")
+            .arg(m_sourceInfo.videoCodec.toUpper()),
+        false);
+
+    QStringList args;
+    args << "-y"
+         << "-i" << inputFilePath
+         << "-map" << "0:v:0";
+
+    if (m_sourceInfo.hasAudio) {
+        args << "-map" << "0:a:0?";
+    }
+
+    args << "-vf" << "scale='min(1280,iw)':-2"
+         << "-pix_fmt" << "yuv420p";
+
+    if (useHardware) {
+        args << "-c:v" << "h264_nvenc"
+             << "-preset" << "p1"
+             << "-rc" << "vbr"
+             << "-cq" << "28"
+             << "-b:v" << "0";
+    } else {
+        args << "-c:v" << "libx264"
+             << "-preset" << "ultrafast"
+             << "-crf" << "28";
+    }
+
+    if (m_sourceInfo.hasAudio) {
+        args << "-c:a" << "aac"
+             << "-b:a" << "96k";
+    } else {
+        args << "-an";
+    }
+
+    args << "-movflags" << "+faststart"
+         << "-loglevel" << "error"
+         << m_previewProxyPath;
+
+    qDebug() << "Generating preview proxy:" << ffmpegPath << args;
+    m_proxyProcess->setProgram(ffmpegPath);
+    m_proxyProcess->setArguments(args);
+    m_proxyProcess->start();
+}
+
+void MainWindow::onProxyFinished(int exitCode, QProcess::ExitStatus exitStatus)
+{
+    if (exitStatus == QProcess::NormalExit && exitCode == 0 && QFile::exists(m_previewProxyPath)) {
+        qDebug() << "Preview proxy generated successfully:" << m_previewProxyPath;
+        m_player->setPreviewSourceFile(m_previewProxyPath);
+        return;
+    }
+
+    qWarning() << "Preview proxy failed (exit:" << exitCode << "):"
+               << QString::fromUtf8(m_proxyProcess->readAllStandardError());
+
+    // If hardware proxy failed (e.g. NVENC session limit), retry once with CPU ultrafast
+    if (m_proxyUsedHw) {
+        generatePreviewProxy(false);
+        return;
+    }
+
+    m_player->setOverlayStatus("Preview unavailable (you can still trim & compress)", false);
+}
+
 void MainWindow::updateEstimatedFileSize()
 {
     if (!m_player || m_sourceInfo.duration <= 0) {
@@ -281,7 +553,7 @@ void MainWindow::updateEstimatedFileSize()
     // --- FPS ---
     int fps = ui->fpsSlider->isEnabled()
                   ? ui->fpsSlider->value()
-                  : int(m_sourceInfo.fps);
+                  : qMax(1, int(std::round(m_sourceInfo.fps)));
 
     // --- Video bitrate (scaled) ---
     int userVideoBitrate = ui->videoBitrateSlider->value();
@@ -289,9 +561,12 @@ void MainWindow::updateEstimatedFileSize()
         computeScaledVideoBitrate(userVideoBitrate, outW, outH, fps);
 
     // --- Audio bitrate ---
-    int audioBitrate = ui->audioBitrateSlider->isEnabled()
+    int audioBitrate = 0;
+    if (m_sourceInfo.hasAudio) {
+        audioBitrate = ui->audioBitrateSlider->isEnabled()
                            ? ui->audioBitrateSlider->value()
-                           : m_sourceInfo.audioBitrate;
+                           : int(m_sourceInfo.audioBitrate);
+    }
 
     double totalBitrateKbps = videoBitrate + audioBitrate;
     if (totalBitrateKbps <= 0) {
@@ -314,6 +589,69 @@ void MainWindow::updateEstimatedFileSize()
         QString("File size: ~%1 MB")
             .arg(sizeMB, 0, 'f', 1)
         );
+}
+
+void MainWindow::fitToDiscordLimit()
+{
+    if (!m_player || m_sourceInfo.duration <= 0)
+        return;
+
+    // Target 9.3 MB to leave safe headroom for MP4 muxing overhead & VBR spikes (<10 MB Discord limit)
+    constexpr double TARGET_MB = 9.3;
+
+    double durationSec = m_sourceInfo.duration;
+    const qint64 startMs = m_player->trimStart();
+    const qint64 endMs   = m_player->trimEnd();
+    if (endMs > startMs)
+        durationSec = (endMs - startMs) / 1000.0;
+
+    if (durationSec <= 0.1)
+        return;
+
+    const double totalTargetKbps = (TARGET_MB * 8.0 * 1024.0) / durationSec;
+
+    int audioBitrate = 0;
+    if (m_sourceInfo.hasAudio) {
+        audioBitrate = ui->audioBitrateSlider->value();
+        // If audio consumes too much of the budget on a longer clip, reduce audio bitrate first
+        if (audioBitrate > 96 && totalTargetKbps < 1500.0) {
+            audioBitrate = qBound(ui->audioBitrateSlider->minimum(), 96, ui->audioBitrateSlider->maximum());
+            ui->audioBitrateSlider->setValue(audioBitrate);
+        }
+        if (audioBitrate > 64 && totalTargetKbps < 800.0) {
+            audioBitrate = qBound(ui->audioBitrateSlider->minimum(), 64, ui->audioBitrateSlider->maximum());
+            ui->audioBitrateSlider->setValue(audioBitrate);
+        }
+    }
+
+    const double targetEffectiveVideoKbps = qMax(200.0, totalTargetKbps - audioBitrate);
+
+    // Invert computeScaledVideoBitrate's factor so estimated & actual output match ~9.3 MB
+    QString res = ui->resolutionCombo->currentData().toString();
+    int outW = m_sourceInfo.width;
+    int outH = m_sourceInfo.height;
+    QStringList parts = res.split("x");
+    if (parts.size() == 2) {
+        outW = parts[0].toInt();
+        outH = parts[1].toInt();
+    }
+
+    int fps = ui->fpsSlider->isEnabled()
+                  ? ui->fpsSlider->value()
+                  : qMax(1, int(std::round(m_sourceInfo.fps)));
+
+    const double refPixels = 1920.0 * 1080.0;
+    const double curPixels = double(outW) * outH;
+    const double resFactor = qBound(0.15, curPixels / refPixels, 1.0);
+    const double fpsFactor = qBound(0.35, fps / 60.0, 1.0);
+
+    int neededSliderValue = int(targetEffectiveVideoKbps / (resFactor * fpsFactor));
+    neededSliderValue = qBound(ui->videoBitrateSlider->minimum(),
+                               neededSliderValue,
+                               ui->videoBitrateSlider->maximum());
+
+    ui->videoBitrateSlider->setValue(neededSliderValue);
+    updateEstimatedFileSize();
 }
 
 void MainWindow::autoAdjustVideoBitrateForResolution()
@@ -346,7 +684,9 @@ void MainWindow::autoAdjustVideoBitrateForResolution()
     scale = qBound(0.30, scale, 1.0);
 
     int newBitrate =
-        int(m_sourceInfo.videoBitrate * scale);
+        qBound(ui->videoBitrateSlider->minimum(),
+               int(m_sourceInfo.videoBitrate * scale),
+               ui->videoBitrateSlider->maximum());
 
     ui->videoBitrateSlider->blockSignals(true);
     ui->videoBitrateSlider->setValue(newBitrate);
@@ -357,89 +697,107 @@ void MainWindow::autoAdjustVideoBitrateForResolution()
             .arg(newBitrate));
 }
 
-
 void MainWindow::selectInputFile()
 {
     m_userAdjustedVideoBitrate = false;
 
-    inputFilePath = QFileDialog::getOpenFileName(
+    QString selected = QFileDialog::getOpenFileName(
         this,
         "Select Video File",
         "",
-        "Videos (*.mp4 *.mkv *.avi *.mov)"
+        "Videos (*.mp4 *.mkv *.webm *.avi *.mov)"
         );
 
-    if (inputFilePath.isEmpty())
+    if (selected.isEmpty())
         return;
 
+    // Cancel any previous preview proxy generation
+    if (m_proxyProcess->state() != QProcess::NotRunning) {
+        m_proxyProcess->kill();
+        m_proxyProcess->waitForFinished(1000);
+    }
+    m_player->clearSource();
+    cleanupPreviewProxy();
+    m_proxyAttempted = false;
+
+    inputFilePath = selected;
     ui->inputLabel->setPlainText(inputFilePath);
 
     m_sourceInfo = probeVideo(inputFilePath);
+
+    if (!m_sourceInfo.hasVideo || m_sourceInfo.width <= 0 || m_sourceInfo.height <= 0 || m_sourceInfo.duration <= 0.0) {
+        QMessageBox::warning(this, "Invalid Video",
+                             "Could not read video metadata with ffprobe.\n"
+                             "Please verify that the selected file is a valid video.");
+        return;
+    }
 
     // ---- Static info ----
     ui->durationLabel->setText(
         QString::number(m_sourceInfo.duration, 'f', 1) + " s");
 
-    //ui->resolutionLabel->setText(
-    //    QString("%1x%2")
-    //        .arg(m_sourceInfo.width)
-    //        .arg(m_sourceInfo.height));
-
+    const QString audioLabel = m_sourceInfo.hasAudio ? m_sourceInfo.audioCodec : QStringLiteral("none");
     ui->codecLabel->setText(
         QString("V: %1 | A: %2")
             .arg(m_sourceInfo.videoCodec)
-            .arg(m_sourceInfo.audioCodec));
-
-    ui->fpsLabel->setText(
-        QString::number(m_sourceInfo.fps, 'f', 2) + " fps");
+            .arg(audioLabel));
 
     // ---- Video bitrate ----
     const int maxVideoBitrate =
-        qMax<qint64>(1, m_sourceInfo.videoBitrate);
+        qMax<int>(200, int(m_sourceInfo.videoBitrate));
+    const int minVideoBitrate = qMin(200, maxVideoBitrate);
 
     ui->videoBitrateSlider->blockSignals(true);
-
     ui->videoBitrateSlider->setEnabled(true);
-    ui->videoBitrateSlider->setMinimum(1);
+    ui->videoBitrateSlider->setMinimum(minVideoBitrate);
     ui->videoBitrateSlider->setMaximum(maxVideoBitrate);
     ui->videoBitrateSlider->setValue(maxVideoBitrate);
-
     ui->videoBitrateSlider->blockSignals(false);
-
 
     ui->videoBitrateLabel->setText(
         QString("Bitrate: %1 kbps").arg(maxVideoBitrate));
 
     // ---- FPS ----
-    const int maxFps = qMax(1, int(m_sourceInfo.fps));
+    const int maxFps = qBound(1, int(std::round(m_sourceInfo.fps)), 240);
 
+    ui->fpsSlider->blockSignals(true);
     ui->fpsSlider->setEnabled(true);
     ui->fpsSlider->setMinimum(1);
     ui->fpsSlider->setMaximum(maxFps);
     ui->fpsSlider->setValue(maxFps);
+    ui->fpsSlider->blockSignals(false);
 
     ui->fpsLabel->setText(
         QString("FPS: %1").arg(maxFps));
 
     // ---- Audio bitrate ----
-    const int maxAudioBitrate =
-        qMax<qint64>(32, m_sourceInfo.audioBitrate);
+    if (m_sourceInfo.hasAudio) {
+        const int maxAudioBitrate =
+            qMax<int>(32, int(m_sourceInfo.audioBitrate));
 
-    ui->audioBitrateSlider->setEnabled(true);
-    ui->audioBitrateSlider->setMinimum(32);
-    ui->audioBitrateSlider->setMaximum(maxAudioBitrate);
-    ui->audioBitrateSlider->setValue(maxAudioBitrate);
+        ui->audioBitrateSlider->blockSignals(true);
+        ui->audioBitrateSlider->setEnabled(true);
+        ui->audioBitrateSlider->setMinimum(32);
+        ui->audioBitrateSlider->setMaximum(maxAudioBitrate);
+        ui->audioBitrateSlider->setValue(maxAudioBitrate);
+        ui->audioBitrateSlider->blockSignals(false);
 
-    ui->audioBitrateLabel->setText(
-        QString("Audio bitrate: %1 kbps").arg(maxAudioBitrate));
+        ui->audioBitrateLabel->setText(
+            QString("Audio bitrate: %1 kbps").arg(maxAudioBitrate));
+    } else {
+        ui->audioBitrateSlider->blockSignals(true);
+        ui->audioBitrateSlider->setEnabled(false);
+        ui->audioBitrateSlider->blockSignals(false);
+        ui->audioBitrateLabel->setText("Audio: none");
+    }
 
     // ---- Resolution ----
+    ui->resolutionCombo->blockSignals(true);
     ui->resolutionCombo->clear();
 
     int w = m_sourceInfo.width;
     int h = m_sourceInfo.height;
 
-    // Helper: avoid duplicates using itemData (not visible text)
     auto addIfMissing = [&](const QString &resValue, const QString &resLabel) {
         for (int i = 0; i < ui->resolutionCombo->count(); ++i) {
             if (ui->resolutionCombo->itemData(i).toString() == resValue)
@@ -448,11 +806,12 @@ void MainWindow::selectInputFile()
         ui->resolutionCombo->addItem(resLabel, resValue);
     };
 
-    // Original resolution (pretty label, clean data)
     QString originalRes = QString("%1x%2").arg(w).arg(h);
     addIfMissing(originalRes, originalRes + " (Original)");
 
-    // Common downscale options
+    if (w >= 2560 && h >= 1440)
+        addIfMissing("2560x1440", "2560x1440");
+
     if (w >= 1920 && h >= 1080)
         addIfMissing("1920x1080", "1920x1080");
 
@@ -465,11 +824,12 @@ void MainWindow::selectInputFile()
     if (w >= 640 && h >= 360)
         addIfMissing("640x360", "640x360");
 
-    // Default to original
     ui->resolutionCombo->setCurrentIndex(0);
     ui->resolutionCombo->setEnabled(true);
+    ui->resolutionCombo->blockSignals(false);
 
-    updateEstimatedFileSize();
+    m_fitDiscordButton->setEnabled(true);
+    ui->progressBar->setValue(0);
 
     // ---- Output path ----
     QFileInfo inputInfo(inputFilePath);
@@ -481,17 +841,25 @@ void MainWindow::selectInputFile()
     ui->outputLabel->setPlainText(outputFilePath);
 
     // ---- Player ----
-    m_player->setSourceFile(inputFilePath);
+    // Initialize timeline duration from ffprobe first so trimming works even if preview falls back
+    m_player->setFrameRate(m_sourceInfo.fps);
+    m_player->setExternalDuration(qint64(m_sourceInfo.duration * 1000.0));
+    m_player->setSourceFile(inputFilePath, m_sourceInfo.hasVideo);
 
-    updateMarkedDuration(0, m_sourceInfo.duration * 1000);
-
+    updateMarkedDuration(0, qint64(m_sourceInfo.duration * 1000.0));
+    updateEstimatedFileSize();
 }
 
 void MainWindow::selectOutputFile()
 {
-    outputFilePath = QFileDialog::getSaveFileName(this, "Select Output File", "", "MP4 Files (*.mp4)");
-    if (!outputFilePath.isEmpty())
+    QString chosen = QFileDialog::getSaveFileName(
+        this, "Select Output File", outputFilePath, "MP4 Files (*.mp4)");
+    if (!chosen.isEmpty()) {
+        if (!chosen.endsWith(".mp4", Qt::CaseInsensitive))
+            chosen += ".mp4";
+        outputFilePath = chosen;
         ui->outputLabel->setPlainText(outputFilePath);
+    }
 }
 
 void MainWindow::updateMarkedDuration(qint64 startMs, qint64 endMs)
@@ -511,15 +879,35 @@ void MainWindow::updateMarkedDuration(qint64 startMs, qint64 endMs)
         );
 }
 
-
+void MainWindow::setEncodingUiBusy(bool busy)
+{
+    ui->inputButton->setEnabled(!busy);
+    ui->outputButton->setEnabled(!busy);
+    ui->startButton->setEnabled(!busy);
+    ui->resolutionCombo->setEnabled(!busy);
+    ui->fpsSlider->setEnabled(!busy);
+    ui->videoBitrateSlider->setEnabled(!busy);
+    ui->audioBitrateSlider->setEnabled(!busy && m_sourceInfo.hasAudio);
+    m_encoderCombo->setEnabled(!busy);
+    m_fitDiscordButton->setEnabled(!busy);
+}
 
 void MainWindow::startEncoding()
 {
     qDebug() << "Start encoding clicked";
 
+    if (ffmpegProcess->state() != QProcess::NotRunning)
+        return;
+
     if (inputFilePath.isEmpty() || outputFilePath.isEmpty()) {
         QMessageBox::warning(this, "Warning",
                              "Please select both input and output files.");
+        return;
+    }
+
+    if (QFileInfo(inputFilePath).canonicalFilePath() == QFileInfo(outputFilePath).canonicalFilePath()) {
+        QMessageBox::warning(this, "Warning",
+                             "Output file cannot overwrite the input file. Please choose a different output path.");
         return;
     }
 
@@ -528,10 +916,11 @@ void MainWindow::startEncoding()
     // --- Trim ---
     qint64 trimStartMs = m_player->trimStart();
     qint64 trimEndMs   = m_player->trimEnd();
+    qint64 fullDurMs   = qint64(m_sourceInfo.duration * 1000.0);
 
     bool hasTrim =
         trimEndMs > trimStartMs &&
-        trimEndMs <= m_sourceInfo.duration * 1000;
+        (trimStartMs > 0 || (fullDurMs > 0 && trimEndMs < fullDurMs - 50));
 
     double trimStartSec = trimStartMs / 1000.0;
     double trimDurationSec =
@@ -555,23 +944,22 @@ void MainWindow::startEncoding()
     // --- Scaled video bitrate ---
     int videoBitrate =
         computeScaledVideoBitrate(userVideoBitrate, outW, outH, fps);
+    videoBitrate = qMax(100, videoBitrate);
     QString videoBitrateArg = QString::number(videoBitrate) + "k";
     QString fpsArg = QString::number(fps);
     QString scaleFilter = QString("scale=%1:%2:flags=lanczos")
-                              .arg(outW / 2 * 2)
-                              .arg(outH / 2 * 2);
+                              .arg(qMax(2, (outW / 2) * 2))
+                              .arg(qMax(2, (outH / 2) * 2));
 
-    // --- CRF tuning ---
-    int crf = 22;
-    if (outH <= 720) crf = 23;
-    if (outH <= 480) crf = 24;
+    QString encoder = m_encoderCombo->currentData().toString();
+    if (encoder.isEmpty())
+        encoder = "libx264";
 
     QStringList args;
     args << "-y";
 
     if (hasTrim) {
-        args << "-ss" << QString::number(trimStartSec, 'f', 3)
-        << "-t"  << QString::number(trimDurationSec, 'f', 3);
+        args << "-ss" << QString::number(trimStartSec, 'f', 3);
         totalDuration = trimDurationSec;
     } else {
         totalDuration = m_sourceInfo.duration;
@@ -579,21 +967,57 @@ void MainWindow::startEncoding()
 
     args << "-i" << inputFilePath;
 
+    if (hasTrim) {
+        args << "-t" << QString::number(trimDurationSec, 'f', 3);
+    }
+
+    // Map primary video and optional primary audio (ignores ShadowPlay data tracks / thumbnails)
+    args << "-map" << "0:v:0";
+    if (m_sourceInfo.hasAudio) {
+        args << "-map" << "0:a:0?";
+    }
+
     // --- Video ---
-    args << "-c:v" << "libx264"
-         << "-preset" << "fast"
-         << "-b:v" << videoBitrateArg
-         << "-maxrate" << videoBitrateArg
-         << "-bufsize" << QString::number(videoBitrate * 2) + "k"
-         << "-r" << fpsArg
+    // Always enforce yuv420p so 10-bit AV1 / HDR sources remain playable on Discord
+    if (encoder == "h264_nvenc") {
+        args << "-c:v" << "h264_nvenc"
+             << "-preset" << "p4"
+             << "-rc" << "vbr"
+             << "-pix_fmt" << "yuv420p"
+             << "-b:v" << videoBitrateArg
+             << "-maxrate" << videoBitrateArg
+             << "-bufsize" << QString::number(videoBitrate * 2) + "k";
+    } else if (encoder == "av1_nvenc") {
+        args << "-c:v" << "av1_nvenc"
+             << "-preset" << "p4"
+             << "-rc" << "vbr"
+             << "-pix_fmt" << "yuv420p"
+             << "-b:v" << videoBitrateArg
+             << "-maxrate" << videoBitrateArg
+             << "-bufsize" << QString::number(videoBitrate * 2) + "k";
+    } else {
+        args << "-c:v" << "libx264"
+             << "-preset" << "fast"
+             << "-pix_fmt" << "yuv420p"
+             << "-b:v" << videoBitrateArg
+             << "-maxrate" << videoBitrateArg
+             << "-bufsize" << QString::number(videoBitrate * 2) + "k";
+    }
+
+    args << "-r" << fpsArg
          << "-vf" << scaleFilter;
 
     // --- Audio ---
-    args << "-c:a" << "aac"
-         << "-b:a" << QString::number(audioBitrate) + "k";
+    if (m_sourceInfo.hasAudio) {
+        args << "-c:a" << "aac"
+             << "-b:a" << QString::number(audioBitrate) + "k";
+    } else {
+        args << "-an";
+    }
 
     // --- MP4 + progress ---
     args << "-movflags" << "+faststart"
+         << "-avoid_negative_ts" << "make_zero"
          << "-progress" << "pipe:1"
          << "-nostats"
          << "-loglevel" << "error";
@@ -602,17 +1026,20 @@ void MainWindow::startEncoding()
 
     qDebug() << "FFmpeg:" << ffmpegPath << args;
 
+    m_ffmpegErrorLog.clear();
+    ui->progressBar->setValue(0);
+    setEncodingUiBusy(true);
+
     ffmpegProcess->setProgram(ffmpegPath);
     ffmpegProcess->setArguments(args);
-    ffmpegProcess->setProcessChannelMode(QProcess::MergedChannels);
     ffmpegProcess->start();
 }
 
-void MainWindow::deleteTrimmedFile(const QString &trimmedFilePath)
+void MainWindow::deleteTrimmedFile(const QString &path)
 {
-    if (!trimmedFilePath.isEmpty() && QFile::exists(trimmedFilePath)) {
-        qDebug() << "Deleting trimmed file:" << trimmedFilePath;
-        QFile::remove(trimmedFilePath);
+    if (!path.isEmpty() && QFile::exists(path)) {
+        qDebug() << "Deleting trimmed file:" << path;
+        QFile::remove(path);
     }
 }
 
@@ -640,44 +1067,63 @@ int MainWindow::getVideoDuration(const QString &filePath)
     qDebug() << "ffprobe output:" << output;
 
     bool ok;
-    int duration = output.toDouble(&ok);
+    int duration = int(output.toDouble(&ok));
     return ok ? duration : 0;
 }
 
 void MainWindow::updateProgress()
 {
-    QString text = ffmpegProcess->readAllStandardOutput();
-    qDebug() << "FFmpeg progress:" << text;
+    const QString text = QString::fromUtf8(ffmpegProcess->readAllStandardOutput());
 
-    static const QRegularExpression re("out_time_ms=([0-9]+)");
-    QRegularExpressionMatch match = re.match(text);
+    static const QRegularExpression re("out_time_(?:us|ms)=([0-9]+)");
+    QRegularExpressionMatchIterator it = re.globalMatch(text);
+    qint64 latestUs = -1;
+    while (it.hasNext()) {
+        QRegularExpressionMatch match = it.next();
+        latestUs = match.captured(1).toLongLong();
+    }
 
-    if (match.hasMatch() && totalDuration > 0) {
-        qint64 currentMs = match.captured(1).toLongLong();
-        int currentSeconds = currentMs / 1000000;
-
-        int percent = qMin((currentSeconds * 100) / totalDuration, 100);
-
-        if (isTrimming) {
-            percent = percent * 40 / 100;        // 0–40%
-        } else {
-            percent = 40 + percent * 60 / 100;   // 40–100%
-        }
-
+    if (latestUs >= 0 && totalDuration > 0.0) {
+        const double currentSeconds = latestUs / 1000000.0;
+        const int percent = qBound(0, int((currentSeconds * 100.0) / totalDuration), 99);
         ui->progressBar->setValue(percent);
     }
+}
 
-    // Only finish when NOT trimming
-    if (text.contains("progress=end") && !isTrimming) {
-        qDebug() << "Compression reported progress=end";
+void MainWindow::onEncodingErrorOutput()
+{
+    m_ffmpegErrorLog += QString::fromUtf8(ffmpegProcess->readAllStandardError());
+}
 
+void MainWindow::onEncodingFinished(int exitCode, QProcess::ExitStatus exitStatus)
+{
+    setEncodingUiBusy(false);
+
+    if (exitStatus == QProcess::NormalExit && exitCode == 0) {
         ui->progressBar->setValue(100);
-        ui->inputButton->setEnabled(true);
-        ui->outputButton->setEnabled(true);
-        ui->startButton->setEnabled(true);
-
-        QMessageBox::information(this, "Finished", "Video compressed!");
+        const double sizeMB = QFileInfo(outputFilePath).size() / (1024.0 * 1024.0);
+        QMessageBox::information(
+            this,
+            "Finished",
+            QString("Video compressed!\nFinal size: %1 MB").arg(sizeMB, 0, 'f', 2));
+    } else {
+        ui->progressBar->setValue(0);
+        QString details = m_ffmpegErrorLog.trimmed();
+        if (details.isEmpty())
+            details = QString("FFmpeg exited with code %1.").arg(exitCode);
+        QMessageBox::critical(this, "Encoding Error",
+                              "Failed to compress video:\n\n" + details);
     }
+}
+
+void MainWindow::onEncodingProcessError(QProcess::ProcessError error)
+{
+    setEncodingUiBusy(false);
+    ui->progressBar->setValue(0);
+    QMessageBox::critical(this, "FFmpeg Process Error",
+                          QString("Could not run FFmpeg (error %1): %2")
+                              .arg(int(error))
+                              .arg(ffmpegProcess->errorString()));
 }
 
 int MainWindow::computeScaledVideoBitrate(int userBitrate,
@@ -701,18 +1147,18 @@ int MainWindow::computeScaledVideoBitrate(int userBitrate,
     int scaled =
         int(userBitrate * resFactor * fpsFactor);
 
-    // Safety clamp
-    scaled = qBound(400, scaled, userBitrate);
+    // Safety clamp (ensure min <= max so qBound never asserts on low bitrates)
+    const int minBitrate = qMin(200, userBitrate);
+    scaled = qBound(minBitrate, scaled, userBitrate);
 
     return scaled;
 }
 
-
-
 void MainWindow::showAboutDialog()
 {
     QMessageBox::about(this, "About",
-                       "<p><b>Clip2Disc</b></p>"
+                       "<p><b>Clip2Disc (AV1 Support Fork)</b></p>"
                        "<p>A wrapper for FFmpeg video compressor that reduces video size to under 10MB, allowing them to be sent in Discord chats.</p>"
-                       "<p><a href='https://github.com/murdoockds/clip2disc'>GitHub Repository</a></p>");
+                       "<p>Includes AV1 playback & preview fallback, 10-bit to 8-bit Discord-safe encoding, NVIDIA NVENC support, and Discord 10MB auto-fit.</p>"
+                       "<p><a href='https://github.com/murdoockds/clip2disc'>Original GitHub Repository</a></p>");
 }

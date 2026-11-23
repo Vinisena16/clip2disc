@@ -18,6 +18,7 @@ public:
     void setEndPosition(qint64 positionMs);
 
     // Getters
+    qint64 duration() const;
     qint64 startPosition() const;
     qint64 endPosition() const;
 

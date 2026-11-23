@@ -20,7 +20,13 @@ public:
     explicit Player(QWidget *parent = nullptr);
 
     void setSource(const QUrl &url);
-    void setSourceFile(const QString &filePath);
+    void setSourceFile(const QString &filePath, bool expectVideo = true);
+    void setPreviewSourceFile(const QString &filePath);
+    void clearSource();
+
+    void setExternalDuration(qint64 durationMs);
+    void setFrameRate(double fps);
+    void setOverlayStatus(const QString &text, bool clickable = false);
 
     void pause();
 
@@ -33,11 +39,15 @@ signals:
     // Emitted when user clicks the overlay
     void requestOpenFile();
 
+    // Emitted when QMediaPlayer fails to decode/display the selected media (e.g. AV1)
+    void playbackFailed(const QString &reason);
+
 protected:
     void resizeEvent(QResizeEvent *event) override;
 
 private:
     void updateControlsEnabled(bool enabled);
+    void checkVideoTrackLoaded(int generation);
     bool m_hasMedia = false;
 
     // --- Playback helpers ---
@@ -50,8 +60,14 @@ private:
     void markEndAtCurrentFrame();
 
     // --- State ---
-    bool m_autoPlayPending = false;
-    bool m_reachedTrimEnd  = false;
+    bool m_autoPlayPending   = false;
+    bool m_reachedTrimEnd    = false;
+    bool m_expectVideo       = true;
+    bool m_usingProxy        = false;
+    bool m_failureReported   = false;
+    bool m_receivedFrame     = false;
+    int  m_loadGeneration    = 0;
+    qint64 m_frameStepMs     = 40;
 
     // --- Core media objects ---
     QMediaPlayer   *m_player      = nullptr;
@@ -70,7 +86,7 @@ private:
     QPushButton    *m_btnNextFrame    = nullptr;
     QPushButton    *m_btnStop         = nullptr;
 
-    QSlider *m_volumeSlider;
+    QSlider *m_volumeSlider = nullptr;
 };
 
 #endif // PLAYER_H
