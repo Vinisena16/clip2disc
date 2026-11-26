@@ -901,20 +901,29 @@ void MainWindow::updateEstimatedFileSize()
     double sizeMB =
         (totalBitrateKbps * durationSec) / (8.0 * 1024.0);
 
+    const QString encoder = m_encoderCombo ? m_encoderCombo->currentData().toString() : QStringLiteral("libx264");
+    const double minHealthyBpp = (encoder == "av1_nvenc") ? 0.025
+                                 : (encoder == "libx264") ? 0.045
+                                                          : 0.050;
+    const double pixelsPerSec = double(outW) * outH * qMax(1, fps);
+    const double bpp = (pixelsPerSec > 0.0) ? ((videoBitrate * 1000.0) / pixelsPerSec) : 0.0;
+    const bool lowMotionQuality = (videoBitrate > 0 && bpp > 0.0 && bpp < minHealthyBpp);
+
     QString badge;
     QString colorHex;
     QString hint;
+    QString hintColor = "#949BA4";
 
     if (sizeMB <= 10.0) {
         badge = "✓ <10 MB";
         colorHex = "#23A55A";
-        hint = QString("Fits Discord Mobile & PC (%1 kbps total • %2s)")
+        hint = QString("Fits Discord Mobile & PC (%1 kbps • %2s)")
                    .arg(int(totalBitrateKbps))
                    .arg(durationSec, 0, 'f', 1);
     } else if (sizeMB <= 20.0) {
         badge = "✓ <20 MB";
         colorHex = "#7983F5";
-        hint = QString("Fits Discord PC (%1 kbps total • %2s)")
+        hint = QString("Fits Discord PC (%1 kbps • %2s)")
                    .arg(int(totalBitrateKbps))
                    .arg(durationSec, 0, 'f', 1);
     } else {
@@ -923,6 +932,13 @@ void MainWindow::updateEstimatedFileSize()
         hint = QString("Too large (%1 kbps • %2s) — lower bitrate/res, trim, or click Auto-fit")
                    .arg(int(totalBitrateKbps))
                    .arg(durationSec, 0, 'f', 1);
+    }
+
+    if (lowMotionQuality && sizeMB <= 20.0) {
+        hint += QString("\n⚠ Low bitrate for %1p@%2fps — motion may pixelate (lower res/FPS or use AV1)")
+                    .arg(outH)
+                    .arg(fps);
+        hintColor = "#F0B232";
     }
 
     ui->fileSizeLabel->setText(
@@ -936,6 +952,7 @@ void MainWindow::updateEstimatedFileSize()
 
     if (m_estimateHintLabel) {
         m_estimateHintLabel->setText(hint);
+        m_estimateHintLabel->setStyleSheet(QString("color: %1; font-size: 11px;").arg(hintColor));
     }
 }
 
@@ -958,7 +975,11 @@ void MainWindow::fitToDiscordLimit(double targetSizeMB)
     int audioBitrate = 0;
     if (m_sourceInfo.hasAudio) {
         audioBitrate = ui->audioBitrateSlider->value();
-        // If audio consumes too much of the budget on a longer clip, reduce audio bitrate first
+        // Trim audio bitrate slightly so video gets maximum motion quality
+        if (audioBitrate > 128 && totalTargetKbps < 4500.0) {
+            audioBitrate = qBound(ui->audioBitrateSlider->minimum(), 128, ui->audioBitrateSlider->maximum());
+            ui->audioBitrateSlider->setValue(audioBitrate);
+        }
         if (audioBitrate > 96 && totalTargetKbps < 1500.0) {
             audioBitrate = qBound(ui->audioBitrateSlider->minimum(), 96, ui->audioBitrateSlider->maximum());
             ui->audioBitrateSlider->setValue(audioBitrate);
@@ -969,32 +990,117 @@ void MainWindow::fitToDiscordLimit(double targetSizeMB)
         }
     }
 
-    const double targetEffectiveVideoKbps = qMax(200.0, totalTargetKbps - audioBitrate);
+    const double targetEffectiveVideoKbps = qMax(250.0, totalTargetKbps - audioBitrate);
 
-    // Invert computeScaledVideoBitrate's factor so estimated & actual output match ~9.3 MB
-    QString res = ui->resolutionCombo->currentData().toString();
-    int outW = m_sourceInfo.width;
-    int outH = m_sourceInfo.height;
-    QStringList parts = res.split("x");
-    if (parts.size() == 2) {
-        outW = parts[0].toInt();
-        outH = parts[1].toInt();
+    // Choose the highest resolution + FPS that preserves clean motion quality (bits per pixel)
+    const QString encoder = m_encoderCombo ? m_encoderCombo->currentData().toString() : QStringLiteral("libx264");
+    const double minTargetBpp = (encoder == "av1_nvenc") ? 0.028
+                                : (encoder == "libx264") ? 0.048
+                                                         : 0.055;
+
+    const int srcFps = qBound(1, int(std::round(m_sourceInfo.fps)), 240);
+    int bestResIndex = ui->resolutionCombo->count() - 1;
+    int bestW = m_sourceInfo.width;
+    int bestH = m_sourceInfo.height;
+    int bestFps = qMin(srcFps, 30);
+    bool found = false;
+
+    auto parseComboRes = [&](int idx, int &w, int &h) -> bool {
+        const QStringList p = ui->resolutionCombo->itemData(idx).toString().split("x");
+        if (p.size() != 2) return false;
+        w = p[0].toInt();
+        h = p[1].toInt();
+        return w > 0 && h > 0;
+    };
+
+    // Pass 1: keep source FPS and pick highest resolution >= 720p with healthy bpp
+    for (int i = 0; i < ui->resolutionCombo->count(); ++i) {
+        int w = 0, h = 0;
+        if (!parseComboRes(i, w, h) || h < 720)
+            continue;
+        const double bpp = (targetEffectiveVideoKbps * 1000.0) / (double(w) * h * srcFps);
+        if (bpp >= minTargetBpp) {
+            bestResIndex = i;
+            bestW = w;
+            bestH = h;
+            bestFps = srcFps;
+            found = true;
+            break;
+        }
     }
 
-    int fps = ui->fpsSlider->isEnabled()
-                  ? ui->fpsSlider->value()
-                  : qMax(1, int(std::round(m_sourceInfo.fps)));
+    // Pass 2: if 720p @ source FPS is still tight, prefer lowering FPS (48 -> 30) at 720p+
+    // before dropping resolution below 720p
+    if (!found) {
+        for (int candidateFps : {48, 30}) {
+            if (candidateFps >= srcFps)
+                continue;
+            for (int i = 0; i < ui->resolutionCombo->count(); ++i) {
+                int w = 0, h = 0;
+                if (!parseComboRes(i, w, h) || h < 720)
+                    continue;
+                const double bpp = (targetEffectiveVideoKbps * 1000.0) / (double(w) * h * candidateFps);
+                if (bpp >= minTargetBpp) {
+                    bestResIndex = i;
+                    bestW = w;
+                    bestH = h;
+                    bestFps = candidateFps;
+                    found = true;
+                    break;
+                }
+            }
+            if (found) break;
+        }
+    }
 
+    // Pass 3: very long clips — step down below 720p at 30fps
+    if (!found) {
+        const int lowFps = qMin(srcFps, 30);
+        for (int i = 0; i < ui->resolutionCombo->count(); ++i) {
+            int w = 0, h = 0;
+            if (!parseComboRes(i, w, h))
+                continue;
+            bestResIndex = i;
+            bestW = w;
+            bestH = h;
+            bestFps = lowFps;
+            const double bpp = (targetEffectiveVideoKbps * 1000.0) / (double(w) * h * lowFps);
+            if (bpp >= minTargetBpp)
+                break;
+        }
+    }
+
+    if (bestResIndex >= 0 && bestResIndex < ui->resolutionCombo->count()) {
+        ui->resolutionCombo->blockSignals(true);
+        ui->resolutionCombo->setCurrentIndex(bestResIndex);
+        ui->resolutionCombo->blockSignals(false);
+    }
+
+    if (ui->fpsSlider->isEnabled()) {
+        const int clampedFps = qBound(ui->fpsSlider->minimum(), bestFps, ui->fpsSlider->maximum());
+        ui->fpsSlider->blockSignals(true);
+        ui->fpsSlider->setValue(clampedFps);
+        ui->fpsSlider->blockSignals(false);
+        ui->fpsLabel->setText(QString("FPS: %1").arg(clampedFps));
+        bestFps = clampedFps;
+    }
+
+    // Invert computeScaledVideoBitrate's factor so estimated & actual output hit targetSizeMB
     const double refPixels = 1920.0 * 1080.0;
-    const double curPixels = double(outW) * outH;
+    const double curPixels = double(bestW) * bestH;
     const double resFactor = qBound(0.15, curPixels / refPixels, 1.0);
-    const double fpsFactor = qBound(0.35, fps / 60.0, 1.0);
+    const double fpsFactor = qBound(0.35, bestFps / 60.0, 1.0);
 
     int neededSliderValue = int(targetEffectiveVideoKbps / (resFactor * fpsFactor));
+    if (neededSliderValue > ui->videoBitrateSlider->maximum() &&
+        targetEffectiveVideoKbps <= m_sourceInfo.videoBitrate) {
+        ui->videoBitrateSlider->setMaximum(neededSliderValue);
+    }
     neededSliderValue = qBound(ui->videoBitrateSlider->minimum(),
                                neededSliderValue,
                                ui->videoBitrateSlider->maximum());
 
+    m_userAdjustedVideoBitrate = true;
     ui->videoBitrateSlider->setValue(neededSliderValue);
     updateEstimatedFileSize();
 }
@@ -1333,30 +1439,54 @@ void MainWindow::startEncoding()
     }
 
     // --- Video ---
-    // Always enforce yuv420p so 10-bit AV1 / HDR sources remain playable on Discord
+    // Always enforce yuv420p so 10-bit AV1 / HDR sources remain playable on Discord.
+    // Allow 1.5x maxrate headroom for high-motion bursts while preserving the average -b:v
+    // size target, use a 2-second keyframe interval, and enable NVENC HQ multipass + AQ.
+    const int maxrateKbps = qMax(videoBitrate + 200, int(std::round(videoBitrate * 1.5)));
+    const int bufsizeKbps = videoBitrate * 2;
+    const int gopSize = qBound(24, fps * 2, 240);
+    const QString maxrateArg = QString::number(maxrateKbps) + "k";
+    const QString bufsizeArg = QString::number(bufsizeKbps) + "k";
+    const QString gopArg = QString::number(gopSize);
+
     if (encoder == "h264_nvenc") {
         args << "-c:v" << "h264_nvenc"
-             << "-preset" << "p4"
+             << "-preset" << "p6"
+             << "-tune" << "hq"
+             << "-multipass" << "fullres"
              << "-rc" << "vbr"
+             << "-rc-lookahead" << "32"
+             << "-spatial-aq" << "1"
+             << "-temporal-aq" << "1"
+             << "-aq-strength" << "8"
+             << "-g" << gopArg
              << "-pix_fmt" << "yuv420p"
              << "-b:v" << videoBitrateArg
-             << "-maxrate" << videoBitrateArg
-             << "-bufsize" << QString::number(videoBitrate * 2) + "k";
+             << "-maxrate" << maxrateArg
+             << "-bufsize" << bufsizeArg;
     } else if (encoder == "av1_nvenc") {
         args << "-c:v" << "av1_nvenc"
-             << "-preset" << "p4"
+             << "-preset" << "p6"
+             << "-tune" << "hq"
+             << "-multipass" << "fullres"
              << "-rc" << "vbr"
+             << "-rc-lookahead" << "32"
+             << "-spatial-aq" << "1"
+             << "-temporal-aq" << "1"
+             << "-aq-strength" << "8"
+             << "-g" << gopArg
              << "-pix_fmt" << "yuv420p"
              << "-b:v" << videoBitrateArg
-             << "-maxrate" << videoBitrateArg
-             << "-bufsize" << QString::number(videoBitrate * 2) + "k";
+             << "-maxrate" << maxrateArg
+             << "-bufsize" << bufsizeArg;
     } else {
         args << "-c:v" << "libx264"
-             << "-preset" << "fast"
+             << "-preset" << "medium"
+             << "-g" << gopArg
              << "-pix_fmt" << "yuv420p"
              << "-b:v" << videoBitrateArg
-             << "-maxrate" << videoBitrateArg
-             << "-bufsize" << QString::number(videoBitrate * 2) + "k";
+             << "-maxrate" << maxrateArg
+             << "-bufsize" << bufsizeArg;
     }
 
     args << "-r" << fpsArg
