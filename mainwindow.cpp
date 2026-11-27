@@ -100,27 +100,33 @@ MainWindow::MainWindow(QWidget *parent)
     ui->inputButton->setFixedHeight(30);
     ui->outputButton->setFixedHeight(30);
 
-    // Add Encoder selector + Discord Auto-fit buttons to sidebar
+    // Add Encoder selector + Auto-fit buttons (Discord & WhatsApp Web) to sidebar
     auto *encoderLabel = new QLabel("Encoder", ui->videoDetails);
     m_encoderCombo = new QComboBox(ui->videoDetails);
     m_encoderCombo->setEnabled(false);
 
-    auto *fitLabel = new QLabel("Auto-fit Discord", ui->videoDetails);
+    auto *fitLabel = new QLabel("Auto-fit Target Size", ui->videoDetails);
     auto *fitRow = new QHBoxLayout();
-    fitRow->setSpacing(6);
+    fitRow->setSpacing(4);
 
     m_fit10MbButton = new QPushButton("<10 MB", ui->videoDetails);
     m_fit10MbButton->setObjectName("fitButton");
-    m_fit10MbButton->setToolTip("Automatically adjust bitrate to fit under 10 MB (~9.3 MB)");
+    m_fit10MbButton->setToolTip("Discord Mobile & PC (<10 MB, targets ~9.3 MB)");
     m_fit10MbButton->setEnabled(false);
 
     m_fit20MbButton = new QPushButton("<20 MB", ui->videoDetails);
     m_fit20MbButton->setObjectName("fitButton");
-    m_fit20MbButton->setToolTip("Automatically adjust bitrate to fit under 20 MB (~18.8 MB)");
+    m_fit20MbButton->setToolTip("Discord PC free limit (<20 MB, targets ~18.8 MB)");
     m_fit20MbButton->setEnabled(false);
+
+    m_fit180MbButton = new QPushButton("<180 MB", ui->videoDetails);
+    m_fit180MbButton->setObjectName("fitButton");
+    m_fit180MbButton->setToolTip("WhatsApp Web max upload (<180 MB, targets ~172 MB)");
+    m_fit180MbButton->setEnabled(false);
 
     fitRow->addWidget(m_fit10MbButton);
     fitRow->addWidget(m_fit20MbButton);
+    fitRow->addWidget(m_fit180MbButton);
 
     m_estimateHintLabel = new QLabel("Select a video to estimate size", ui->videoDetails);
     m_estimateHintLabel->setWordWrap(true);
@@ -161,6 +167,7 @@ MainWindow::MainWindow(QWidget *parent)
     connect(ui->aboutButton, &QPushButton::clicked, this, &MainWindow::showAboutDialog);
     connect(m_fit10MbButton, &QPushButton::clicked, this, [this]() { fitToDiscordLimit(9.3); });
     connect(m_fit20MbButton, &QPushButton::clicked, this, [this]() { fitToDiscordLimit(18.8); });
+    connect(m_fit180MbButton, &QPushButton::clicked, this, [this]() { fitToDiscordLimit(172.0); });
 
     ffmpegProcess->setProcessChannelMode(QProcess::SeparateChannels);
     connect(ffmpegProcess, &QProcess::readyReadStandardOutput,
@@ -405,7 +412,8 @@ void MainWindow::applyModernTheme()
             background-color: #248046;
             color: #FFFFFF;
             border: none;
-            padding: 6px 8px;
+            padding: 6px 4px;
+            font-size: 12px;
         }
         QPushButton#fitButton:hover {
             background-color: #1A6334;
@@ -571,13 +579,13 @@ void MainWindow::detectAvailableEncoders()
     qDebug() << "Detected hardware encoders - h264_nvenc:" << m_hasH264Nvenc
              << "av1_nvenc:" << m_hasAv1Nvenc;
 
+    if (m_hasAv1Nvenc) {
+        m_encoderCombo->addItem("AV1 (NVIDIA NVENC)", "av1_nvenc");
+    }
     if (m_hasH264Nvenc) {
         m_encoderCombo->addItem("H.264 (NVIDIA NVENC)", "h264_nvenc");
     }
     m_encoderCombo->addItem("H.264 (CPU - libx264)", "libx264");
-    if (m_hasAv1Nvenc) {
-        m_encoderCombo->addItem("AV1 (NVIDIA NVENC)", "av1_nvenc");
-    }
 
     m_encoderCombo->setCurrentIndex(0);
     m_encoderCombo->setEnabled(true);
@@ -926,15 +934,21 @@ void MainWindow::updateEstimatedFileSize()
         hint = QString("Fits Discord PC (%1 kbps • %2s)")
                    .arg(int(totalBitrateKbps))
                    .arg(durationSec, 0, 'f', 1);
+    } else if (sizeMB <= 180.0) {
+        badge = "✓ <180 MB";
+        colorHex = "#F0B232";
+        hint = QString("Fits WhatsApp Web — over Discord 20 MB (%1 kbps • %2s)")
+                   .arg(int(totalBitrateKbps))
+                   .arg(durationSec, 0, 'f', 1);
     } else {
-        badge = "⚠ >20 MB";
+        badge = "⚠ >180 MB";
         colorHex = "#F23F43";
         hint = QString("Too large (%1 kbps • %2s) — lower bitrate/res, trim, or click Auto-fit")
                    .arg(int(totalBitrateKbps))
                    .arg(durationSec, 0, 'f', 1);
     }
 
-    if (lowMotionQuality && sizeMB <= 20.0) {
+    if (lowMotionQuality && sizeMB <= 180.0) {
         hint += QString("\n⚠ Low bitrate for %1p@%2fps — motion may pixelate (lower res/FPS or use AV1)")
                     .arg(outH)
                     .arg(fps);
@@ -1289,6 +1303,7 @@ void MainWindow::loadInputFile(const QString &selected)
 
     m_fit10MbButton->setEnabled(true);
     m_fit20MbButton->setEnabled(true);
+    m_fit180MbButton->setEnabled(true);
     ui->progressBar->setValue(0);
 
     // ---- Output path ----
@@ -1351,6 +1366,7 @@ void MainWindow::setEncodingUiBusy(bool busy)
     m_encoderCombo->setEnabled(!busy);
     m_fit10MbButton->setEnabled(!busy);
     m_fit20MbButton->setEnabled(!busy);
+    m_fit180MbButton->setEnabled(!busy);
 }
 
 void MainWindow::startEncoding()
